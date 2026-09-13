@@ -25,9 +25,26 @@ function makeFakePage(overrides = {}) {
 // `context.newPage()` is called once per scraper invocation, so a single page
 // config is normally enough — a scraper reuses the same page object for every
 // navigation within one search() call (see paypay.js's warmup + search).
-function makeFakeContext(pageOverrides) {
+//
+// contextOverrides.requestGet fakes `context.request.get()` — paypay.js's
+// lightweight HTTP warmup. Defaults to an always-successful 200 response so
+// every existing test (which only cares about the search page response) does
+// not need to know about the warmup request at all.
+//
+// contextOverrides.cookies / .addCookies fake the cookie-jar side of
+// paypay.js's session cache (see paypaySession.js): `cookies()` is what gets
+// read after a fresh warmup to populate the cache, `addCookies()` is what
+// gets called instead of doing a warmup at all when a cached session exists.
+// Both default to harmless no-ops so tests that don't care about the cache
+// don't need to know about it.
+function makeFakeContext(pageOverrides, contextOverrides = {}) {
   return {
     newPage: async () => makeFakePage(pageOverrides),
+    request: {
+      get: contextOverrides.requestGet || (async () => ({ ok: () => true, status: () => 200 })),
+    },
+    cookies: contextOverrides.cookies || (async () => []),
+    addCookies: contextOverrides.addCookies || (async () => {}),
   };
 }
 

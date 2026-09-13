@@ -52,16 +52,23 @@ test('a correctly computed outer deadline lets every retry attempt run to comple
   assert.equal(getCalls(), 3, 'all 3 attempts must run within the computed deadline');
 });
 
-test('computeOuterDeadlineMs scales the deadline for multi-navigation attempts (PayPay-style)', () => {
+test('computeOuterDeadlineMs scales the RAW (uncapped) deadline for multi-navigation attempts (PayPay-style)', () => {
+  // maxDeadlineMs is set to Infinity here to isolate the raw attempts x
+  // per-attempt-timeout formula from the hard cap (see
+  // test/unit/deadlineCap.test.js) — at real production scale
+  // (perNavTimeoutMs=20000) the default cap flattens both of these to the
+  // same ~45000ms ceiling, which is the whole point of the cap, but the raw
+  // formula underneath must still scale correctly with navigation count.
   const perNavTimeoutMs = 20000;
-  const singleNavDeadline = computeOuterDeadlineMs({ navigationsPerAttempt: 1, perNavTimeoutMs });
-  const doubleNavDeadline = computeOuterDeadlineMs({ navigationsPerAttempt: 2, perNavTimeoutMs });
+  const maxDeadlineMs = Number.POSITIVE_INFINITY;
+  const singleNavDeadline = computeOuterDeadlineMs({ navigationsPerAttempt: 1, perNavTimeoutMs, maxDeadlineMs });
+  const doubleNavDeadline = computeOuterDeadlineMs({ navigationsPerAttempt: 2, perNavTimeoutMs, maxDeadlineMs });
 
   assert.equal(singleNavDeadline, perNavTimeoutMs * 3 + 3000);
   assert.equal(doubleNavDeadline, perNavTimeoutMs * 2 * 3 + 3000);
   assert.ok(
     doubleNavDeadline > singleNavDeadline,
-    'a source needing 2 navigations per attempt (PayPay) must get a larger outer deadline'
+    'a source needing 2 navigations per attempt (PayPay) must get a larger raw deadline'
   );
 });
 

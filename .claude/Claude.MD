@@ -82,7 +82,19 @@ The 175,000 VND/kg shipping is the cost from JP to Vietnam by air cargo.
   constant. Do not go back to reusing `SCRAPER_TIMEOUT_MS` directly as the
   outer route deadline: a single attempt's internal timeout can then consume
   the whole outer deadline and starve every retry (this exact bug happened
-  once — see `test/unit/retryTimeoutBudget.test.js`'s regression test). The
+  once — see `test/unit/retryTimeoutBudget.test.js`'s regression test).
+  **Hard cap (added 2026-09-13):** the derived deadline is capped by
+  `MAX_SEARCH_DEADLINE_MS` (env-configurable; default = `PER_NAV_TIMEOUT_MS ×
+  2 + 5000ms`, i.e. one full PayPay-shaped attempt plus a safety margin — ~45s
+  in dev, ~55s in prod at `SCRAPER_TIMEOUT_MS=25000`) so a single struggling
+  source can never hold the whole `/search` response open for the ~150s the
+  uncapped formula could otherwise reach. Under the cap, Mercari/Yahoo
+  typically still get ~2 full attempts; PayPay is guaranteed exactly 1 full
+  attempt (its structural minimum) with only a small chance at a 2nd if it
+  fails fast rather than timing out — see
+  `test/unit/deadlineCap.test.js`. Don't lower `MAX_SEARCH_DEADLINE_MS` below
+  `PER_NAV_TIMEOUT_MS × 2` or PayPay's very first attempt can get cut off
+  mid-navigation. The
   route still uses `Promise.all` with `withTimeout` wrappers, never
   `Promise.race` (we want partial results, not first-to-finish) — that part is
   unchanged.

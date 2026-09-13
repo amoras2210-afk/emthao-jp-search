@@ -28,9 +28,20 @@ const ALL_SOURCES = ['mercari', 'yahoo', 'paypay'];
 // deadline sized only for a single navigation.
 const NAVIGATIONS_PER_ATTEMPT = { paypay: 2 };
 // Concurrency cap on cross-source scrapes. Free tier OOMs at 3 parallel
-// Chromium tabs; 2 leaves Mercari + Yahoo room while PayPay (which fast-fails
-// via geo-block detection) waits its turn.
+// Chromium tabs; 2 leaves room for 2 sources to run at once while the 3rd
+// waits its turn.
 const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY, 10) || 2;
+// Order in which sources are SUBMITTED to the concurrency limiter below —
+// this only changes who gets a slot first, not SCRAPE_CONCURRENCY itself.
+// PayPay is submitted alongside Mercari (both start immediately under the
+// default concurrency of 2) instead of after Yahoo. A live diagnostic
+// (2026-09-13) showed PayPay's own work drops from ~26s to ~10s when it
+// isn't forced to wait behind the two faster sources — Yahoo (the fastest
+// source) absorbs the wait for a slot instead. Purely a LAUNCH-order
+// optimization: the `sources` field echoed in the response, and the order of
+// items in `results` below, both stay in the original requested order — the
+// results are re-keyed by source and flattened via `sources`, not this order.
+const SUBMISSION_PRIORITY = { paypay: 0, mercari: 1, yahoo: 2 };
 
 router.get('/search', async (req, res) => {
   const q = String(req.query.q || '').trim();
@@ -69,9 +80,15 @@ router.get('/search', async (req, res) => {
   }
 
   const limiter = pLimit(SCRAPE_CONCURRENCY);
+  // Scheduling order only (see SUBMISSION_PRIORITY above) — `sources` itself
+  // (used for the response payload and cache key) stays in its original,
+  // requested order.
+  const schedulingOrder = [...sources].sort(
+    (a, b) => (SUBMISSION_PRIORITY[a] ?? 99) - (SUBMISSION_PRIORITY[b] ?? 99)
+  );
   try {
     const perScraperResults = await Promise.all(
-      sources.map((src) => {
+      schedulingOrder.map((src) => {
         // The outer deadline is derived from the retry policy (attempts +
         // delays) and how many navigations this source needs per attempt —
         // not an independently-picked constant — so it always has room for
@@ -96,12 +113,21 @@ router.get('/search', async (req, res) => {
         );
       })
     );
-    // Flatten and dedupe by URL — defensive guard against scrapers that
-    // accidentally pick up the same listing twice (selector overlap, etc.).
+    // perScraperResults is positionally aligned with schedulingOrder (launch
+    // order), not `sources` (requested order) — re-key by source first so
+    // the flattening below can iterate in the original `sources` order.
+    // Otherwise the item order in `results` would silently follow whichever
+    // source got launched first, which is a launch-time optimization detail,
+    // not something callers should see reflected in response ordering.
+    const resultsBySource = new Map(schedulingOrder.map((src, i) => [src, perScraperResults[i]]));
+
+    // Flatten (in the original requested `sources` order) and dedupe by URL
+    // — the dedupe is a defensive guard against scrapers that accidentally
+    // pick up the same listing twice (selector overlap, etc.).
     const seen = new Set();
     const results = [];
-    for (const arr of perScraperResults) {
-      for (const item of arr) {
+    for (const src of sources) {
+      for (const item of resultsBySource.get(src) || []) {
         if (!item.url || seen.has(item.url)) continue;
         seen.add(item.url);
         results.push(item);
