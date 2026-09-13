@@ -7,6 +7,9 @@ const pricing = require('../config/pricing');
 const mercari = require('../scrapers/mercari');
 const yahoo = require('../scrapers/yahoo');
 const paypay = require('../scrapers/paypay');
+const { retry } = require('../util/retry');
+const { withTimeout } = require('../util/withTimeout');
+const { RETRY_ATTEMPTS, RETRY_DELAYS_MS, computeOuterDeadlineMs } = require('../util/scraperTimeout');
 
 const router = express.Router();
 
@@ -17,41 +20,17 @@ const SCRAPERS = {
 };
 
 const ALL_SOURCES = ['mercari', 'yahoo', 'paypay'];
-// Render free is 0.1 CPU / 512 MB — page.goto routinely needs 8-15 s under
-// CPU contention. Localhost finishes in 2-4 s. Tunable via env so local dev
-// can keep the snappier 12 s while prod uses the bigger budget.
-const SCRAPER_TIMEOUT_MS = parseInt(process.env.SCRAPER_TIMEOUT_MS, 10) || 20000;
+// How many sequential page navigations one retry attempt needs for each
+// source. Everyone does a single page.goto; PayPay does homepage-warmup +
+// search (see paypay.skill.md). This feeds computeOuterDeadlineMs() below so
+// PayPay's outer deadline accounts for needing 2x the per-navigation budget
+// per attempt — without it, PayPay's own internal timeout could exceed a
+// deadline sized only for a single navigation.
+const NAVIGATIONS_PER_ATTEMPT = { paypay: 2 };
 // Concurrency cap on cross-source scrapes. Free tier OOMs at 3 parallel
 // Chromium tabs; 2 leaves Mercari + Yahoo room while PayPay (which fast-fails
 // via geo-block detection) waits its turn.
 const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY, 10) || 2;
-
-function withTimeout(promise, ms, fallback, label) {
-  return new Promise((resolve) => {
-    let done = false;
-    const t = setTimeout(() => {
-      if (done) return;
-      done = true;
-      logger.warn({ scraper: label, status: 'timeout', timeoutMs: ms }, 'scraper timed out');
-      resolve(fallback);
-    }, ms);
-    promise.then(
-      (val) => {
-        if (done) return;
-        done = true;
-        clearTimeout(t);
-        resolve(val);
-      },
-      (err) => {
-        if (done) return;
-        done = true;
-        clearTimeout(t);
-        logger.error({ scraper: label, error: err.message }, 'scraper threw');
-        resolve(fallback);
-      }
-    );
-  });
-}
 
 router.get('/search', async (req, res) => {
   const q = String(req.query.q || '').trim();
@@ -92,11 +71,30 @@ router.get('/search', async (req, res) => {
   const limiter = pLimit(SCRAPE_CONCURRENCY);
   try {
     const perScraperResults = await Promise.all(
-      sources.map((src) =>
-        limiter(() =>
-          withTimeout(SCRAPERS[src](context, q, { limit, yahooMode, page }), SCRAPER_TIMEOUT_MS, [], src)
-        )
-      )
+      sources.map((src) => {
+        // The outer deadline is derived from the retry policy (attempts +
+        // delays) and how many navigations this source needs per attempt —
+        // not an independently-picked constant — so it always has room for
+        // every attempt retry() might actually make. See scraperTimeout.js.
+        const deadlineMs = computeOuterDeadlineMs({
+          navigationsPerAttempt: NAVIGATIONS_PER_ATTEMPT[src] || 1,
+        });
+        return limiter(() =>
+          withTimeout(
+            retry(
+              () => SCRAPERS[src](context, q, { limit, yahooMode, page }),
+              {
+                attempts: RETRY_ATTEMPTS,
+                delays: RETRY_DELAYS_MS,
+                label: src,
+              }
+            ),
+            deadlineMs,
+            [],
+            src
+          )
+        );
+      })
     );
     // Flatten and dedupe by URL — defensive guard against scrapers that
     // accidentally pick up the same listing twice (selector overlap, etc.).

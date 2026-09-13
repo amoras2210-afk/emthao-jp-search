@@ -56,6 +56,17 @@ When `yahooMode=all`, fall back to the per-card heuristic: `mode: card.querySele
 }
 ```
 
+## Error handling contract: throw vs. return `[]`
+
+- **Throws** (retryable, transient/technical failure — `retry()` in
+  `routes/search.js` retries the whole `search()` call): `page.goto` timeout
+  or any other unexpected error.
+- **Returns `[]` without throwing** (legitimate outcome, retrying wouldn't
+  help): `.Product` never renders within the remaining budget. This is
+  ambiguous by design — it could mean a real 0-result search or a slow
+  render — but Yahoo treats it as "no results" rather than an error; see
+  `test/scraper-failures/yahoo.test.js`, which locks in this choice.
+
 ## Maintenance signals
 
 - **`itemCount: 0` while `status: 'no-items'`** → `.Product` class is gone. Re-verify the listing-page DOM with DevTools, update `selectors.js` `verifiedAt` and the per-field selectors.

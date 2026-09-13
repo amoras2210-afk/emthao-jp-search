@@ -3,11 +3,11 @@ const { paceDomain } = require('../concurrency');
 const { toItem } = require('./normalize');
 const { parsePrice } = require('../util/parsePrice');
 const { absoluteUrl } = require('../util/absoluteUrl');
+const { PER_NAV_TIMEOUT_MS: TIMEOUT_MS } = require('../util/scraperTimeout');
 
 const SOURCE = 'yahoo';
 const HOST = 'auctions.yahoo.co.jp';
 const BASE = 'https://auctions.yahoo.co.jp';
-const TIMEOUT_MS = 12000;
 
 function buildUrl(query, mode, page, limit) {
   let url = `${BASE}/search/search?p=${encodeURIComponent(query)}&va=${encodeURIComponent(query)}`;
@@ -114,7 +114,10 @@ async function search(context, query, opts = {}) {
       { scraper: SOURCE, durationMs: Date.now() - start, error: err.message },
       'yahoo scrape failed'
     );
-    return [];
+    // Rethrow so retry() can retry a transient navigation/response failure (e.g.
+    // page.goto timeout). A genuinely empty search ('no-items' above) still returns
+    // [] without throwing.
+    throw err;
   } finally {
     await page.close().catch(() => {});
   }

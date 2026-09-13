@@ -7,7 +7,11 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "install:browsers": "playwright install chromium"
+    "install:browsers": "playwright install chromium",
+    "test": "npm run test:unit && npm run test:failures && npm run test:integration",
+    "test:unit": "node --test \"test/unit/*.test.js\"",
+    "test:failures": "node --test \"test/scraper-failures/*.test.js\"",
+    "test:integration": "node --test --test-concurrency=1 \"test/integration/*.test.js\""
   },
   "dependencies": {
     "cors": "^2.8.5",

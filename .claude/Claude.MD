@@ -65,10 +65,27 @@ The 175,000 VND/kg shipping is the cost from JP to Vietnam by air cargo.
   proxy: `<host-with-dashes>.translate.goog/...?_x_tr_sl=ja&_x_tr_tl=en&_x_tr_hl=en`.
 - Cache is in-memory `lru-cache` for Phase 1. Phase 2 swaps to Upstash Redis
   behind the same `cache.js` interface.
-- Scraper hard timeout is **12 s**. Scraper failure returns `[]`, never throws —
-  so partial results are always returned. The route uses `Promise.all` with
-  `withTimeout` wrappers, never `Promise.race` (we want partial results, not
-  first-to-finish).
+- **Retry + timeout contract (updated 2026-09-13):** each scraper's own
+  navigation timeout (`PER_NAV_TIMEOUT_MS`, env `SCRAPER_TIMEOUT_MS`, default
+  20 s, tuned for Render free tier) is now a **per-navigation** budget, not the
+  whole request budget. A scraper module throws on transient/technical
+  failures (navigation timeout, API response never observed, malformed JSON)
+  so `retry()` (`backend/src/util/retry.js`, 3 attempts, delays `[1000,
+  2000]`) can retry the whole `search()` call. It still returns `[]` without
+  throwing for legitimate no-result / known-blocked states (empty result set,
+  Yahoo `.Product` never rendering, PayPay's http-error/no-anchors/geo-blocked
+  states) — retrying those wouldn't change the outcome. `routes/search.js`
+  wraps `retry(...)` in a `withTimeout` whose deadline is *derived*, via
+  `backend/src/util/scraperTimeout.js`'s `computeOuterDeadlineMs()`, from the
+  retry policy and how many sequential navigations one attempt needs (1 for
+  Mercari/Yahoo, 2 for PayPay's warmup+search) — never an independently-picked
+  constant. Do not go back to reusing `SCRAPER_TIMEOUT_MS` directly as the
+  outer route deadline: a single attempt's internal timeout can then consume
+  the whole outer deadline and starve every retry (this exact bug happened
+  once — see `test/unit/retryTimeoutBudget.test.js`'s regression test). The
+  route still uses `Promise.all` with `withTimeout` wrappers, never
+  `Promise.race` (we want partial results, not first-to-finish) — that part is
+  unchanged.
 - **FR-20 Local Bookmarks (added 2026-05-10):** localStorage-only, key
   `emthao.bookmarks`, FIFO 200-item cap, keyed by `item.url`. Heart toggle on
   every result + dedicated Bookmarks view. Phase 4 will upgrade to cloud sync,

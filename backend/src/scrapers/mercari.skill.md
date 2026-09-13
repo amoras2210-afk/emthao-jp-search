@@ -30,12 +30,22 @@ The JSON API at `https://api.mercari.jp/v2/entities:search` returns prices in pl
 ```js
 const apiResponsePromise = page.waitForResponse(
   (resp) => resp.url().includes('/v2/entities:search') && resp.request().method() === 'POST',
-  { timeout: 12000 }
+  { timeout: TIMEOUT_MS } // src/util/scraperTimeout.js's PER_NAV_TIMEOUT_MS, default 20000
 );
 await page.goto(url, { waitUntil: 'domcontentloaded' });
 const resp = await apiResponsePromise;
 const body = await resp.json();
 ```
+
+## Error handling contract: throw vs. return `[]`
+
+- **Throws** (retryable, transient/technical failure — `retry()` in
+  `routes/search.js` retries the whole `search()` call): `page.goto` timeout,
+  the search API response never observed within `TIMEOUT_MS`, malformed API
+  JSON.
+- **Returns `[]` without throwing** (legitimate outcome, retrying wouldn't
+  help): a genuinely empty API result (`body.items` is `[]` or all filtered
+  out by the on-sale/Beyond-Shops rules above).
 
 ## Item shape (from API)
 

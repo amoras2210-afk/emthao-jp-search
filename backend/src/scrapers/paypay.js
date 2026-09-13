@@ -3,11 +3,15 @@ const { paceDomain } = require('../concurrency');
 const { toItem } = require('./normalize');
 const { parsePrice } = require('../util/parsePrice');
 const { absoluteUrl } = require('../util/absoluteUrl');
+const { PER_NAV_TIMEOUT_MS: TIMEOUT_MS } = require('../util/scraperTimeout');
 
 const SOURCE = 'paypay';
 const HOST = 'paypayfleamarket.yahoo.co.jp';
 const BASE = 'https://paypayfleamarket.yahoo.co.jp';
-const TIMEOUT_MS = 12000;
+// PayPay does 2 sequential navigations per attempt (homepage warmup, then
+// search) — each uses the full TIMEOUT_MS below. routes/search.js's
+// NAVIGATIONS_PER_ATTEMPT.paypay = 2 accounts for this when sizing the outer
+// retry deadline (see scraperTimeout.js).
 // PayPay shows this string and falls back to generic recommendations when it can't load
 // search results — typically because the request originates from outside Japan.
 const GEO_FAIL_MARKERS = ['データの取得に失敗しました', 'あなたへのおすすめ'];
@@ -107,7 +111,10 @@ async function search(context, query, opts = {}) {
       { scraper: SOURCE, durationMs: Date.now() - start, error: err.message },
       'paypay scrape failed'
     );
-    return [];
+    // Rethrow so retry() can retry a transient navigation/response failure. Known
+    // no-result states (no-anchors, geo-blocked, http-error) still return [] above
+    // without throwing — retrying those wouldn't change the outcome.
+    throw err;
   } finally {
     await page.close().catch(() => {});
   }

@@ -1,12 +1,12 @@
 const { logger } = require('../logger');
 const { paceDomain } = require('../concurrency');
 const { toItem } = require('./normalize');
+const { PER_NAV_TIMEOUT_MS: TIMEOUT_MS } = require('../util/scraperTimeout');
 
 const SOURCE = 'mercari';
 const HOST = 'jp.mercari.com';
 const BASE = 'https://jp.mercari.com';
 const API_MATCH = '/v2/entities:search';
-const TIMEOUT_MS = 12000;
 
 // Mercari item-condition codes → human label (Japanese, as shown on listing).
 const CONDITION_MAP = {
@@ -44,7 +44,10 @@ async function search(context, query, opts = {}) {
         { scraper: SOURCE, status: 'no-api-response', durationMs: Date.now() - start },
         'mercari API not observed'
       );
-      return [];
+      // Mercari's SPA fires this API call for every search, including 0-result ones —
+      // never observing it means the page failed to load in time, not a real empty
+      // result. Throw so the retry() wrapper in routes/search.js retries the navigation.
+      throw new Error('mercari API response not observed (timeout)');
     }
 
     let body;
@@ -55,7 +58,8 @@ async function search(context, query, opts = {}) {
         { scraper: SOURCE, status: 'bad-json', error: err.message },
         'mercari API JSON parse failed'
       );
-      return [];
+      // Malformed/truncated response — transient, not a real empty search. Retry.
+      throw err;
     }
 
     const apiItems = Array.isArray(body?.items) ? body.items : [];
@@ -111,7 +115,9 @@ async function search(context, query, opts = {}) {
       { scraper: SOURCE, durationMs: Date.now() - start, error: err.message },
       'mercari scrape failed'
     );
-    return [];
+    // Rethrow so retry() can retry a transient navigation/response failure. A
+    // genuinely empty search never reaches here — it returns [] above without throwing.
+    throw err;
   } finally {
     await page.close().catch(() => {});
   }

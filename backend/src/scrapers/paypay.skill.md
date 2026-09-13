@@ -22,7 +22,28 @@ Sequence per scrape:
 7. Defensive check: if page text contains **both** `データの取得に失敗しました` AND `あなたへのおすすめ`, log `geo-blocked` and return `[]` (rare under warmup; covers the case where Yahoo tightens the gate further).
 8. Extract from each anchor: `href`, `<img alt>` (title), `<img src>` (image), innerText `/([\d,]+)\s*円/` (price).
 
-Total overhead vs cold scrape: ~1-2 s. Well within the 12 s timeout.
+Total overhead vs cold scrape: ~1-2 s.
+
+PayPay is the one scraper that does **2 sequential navigations per attempt**
+(homepage warmup + search), each budgeted up to `TIMEOUT_MS`
+(`src/util/scraperTimeout.js`'s `PER_NAV_TIMEOUT_MS`, default 20 s). One retry
+attempt can therefore legitimately take up to ~2x a single-navigation
+scraper's worst case. `routes/search.js` accounts for this via
+`NAVIGATIONS_PER_ATTEMPT.paypay = 2` when computing the outer retry deadline —
+don't remove that entry, or PayPay's own internal timeout budget can exceed
+the deadline the route allows it and every retry after the first gets cut
+off.
+
+## Error handling contract: throw vs. return `[]`
+
+- **Throws** (retryable, transient/technical failure — `retry()` in
+  `routes/search.js` retries the whole `search()` call, including re-running
+  the warmup): the homepage warmup `page.goto` failing, or any other
+  unexpected error during navigation.
+- **Returns `[]` without throwing** (known no-result / blocked state,
+  retrying wouldn't change the outcome): non-200 response after warmup
+  (`http-error`), no item anchors rendered in time (`no-anchors`), or the
+  geo-block/recommendations-fallback markers detected (`geo-blocked`).
 
 ## Item shape
 
