@@ -22,5 +22,12 @@ services:
       # can lower SCRAPER_TIMEOUT_MS back to 12000 + raise SCRAPE_CONCURRENCY.
       - key: SCRAPER_TIMEOUT_MS
         value: 25000
+      # Dropped from 2 to 1 (2026-09-14): controlled A/B test proved Yahoo
+      # degrades from 20 real results (LIVE, ~19s) to 0 results (DEGRADED, no
+      # error) purely from running concurrently with Mercari on Render free's
+      # 0.1 vCPU — same query, only difference was concurrency. Serializing
+      # scrapers trades total /search latency for per-source reliability.
+      # Does not touch Mercari's own separate failure (reproducible even
+      # with concurrency=1, unrelated root cause — see diagnostic).
       - key: SCRAPE_CONCURRENCY
-        value: 2
+        value: 1
