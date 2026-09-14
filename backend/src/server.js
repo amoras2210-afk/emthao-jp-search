@@ -4,6 +4,7 @@ const cors = require('cors');
 const { logger } = require('./logger');
 const { getBrowser } = require('./browser');
 const { validateAllowedOrigin } = require('./config/validateAllowedOrigin');
+const { requireBearerToken } = require('./config/searchAuth');
 const searchRoute = require('./routes/search');
 const healthRoute = require('./routes/health');
 
@@ -38,6 +39,12 @@ app.use(
   })
 );
 app.use(express.json());
+
+// Optional Bearer-token auth (JP_SEARCH_SERVICE_TOKEN) for FlipRadar's
+// integration — see config/searchAuth.js. Scoped to /search only so
+// Render's own unauthenticated platform health check against /health
+// keeps working regardless of whether a token is configured.
+app.use('/search', requireBearerToken(process.env.JP_SEARCH_SERVICE_TOKEN || ''));
 
 app.use(searchRoute);
 app.use(healthRoute);

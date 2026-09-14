@@ -21,6 +21,101 @@ const SCRAPERS = {
 };
 
 const ALL_SOURCES = ['mercari', 'yahoo', 'paypay'];
+
+// --- FlipRadar API-contract adapter (route layer only — scrapers below are
+// untouched). FlipRadar's emthaoProvider.ts / httpProvider.ts speak a
+// specific wire contract: source IDs are MERCARI_JP/YAHOO_AUCTIONS_JP/
+// PAYPAY_FLEA_JP (not our internal mercari/yahoo/paypay), the marketplace
+// filter param is `marketplaces` (not `sources`), and each result item needs
+// a `source` field matching one of those IDs exactly — httpProvider.ts does
+// `data.results.filter((r) => r.source === opts.id)`, so a mismatched ID
+// silently drops every item for that marketplace. Everything below only
+// reshapes what the scrapers already return; it does not change scraper
+// behavior. `sources=` (lowercase, comma-separated) keeps working unchanged
+// for the existing emthao-jp-search/frontend.
+const MARKETPLACE_TO_INTERNAL = {
+  MERCARI_JP: 'mercari',
+  YAHOO_AUCTIONS_JP: 'yahoo',
+  PAYPAY_FLEA_JP: 'paypay',
+};
+const INTERNAL_TO_MARKETPLACE = {
+  mercari: 'MERCARI_JP',
+  yahoo: 'YAHOO_AUCTIONS_JP',
+  paypay: 'PAYPAY_FLEA_JP',
+};
+
+// Mercari condition labels are intentionally kept in Japanese on the item
+// itself (source-of-truth value, see .claude/CLAUDE.md "Frontend UI is
+// English-only" — the emthao-jp-search frontend translates them at render
+// time via labels.js). FlipRadar instead expects raw.condition to already be
+// one of NEW/LIKE_NEW/GOOD/FAIR/POOR (asCondition() in httpProvider.ts
+// defaults anything else to GOOD), so this maps only for the FlipRadar-shaped
+// response — the scraper's own Japanese-label output is untouched.
+const MERCARI_CONDITION_TO_ENUM = {
+  '新品、未使用': 'NEW',
+  '未使用に近い': 'LIKE_NEW',
+  '目立った傷や汚れなし': 'GOOD',
+  'やや傷や汚れあり': 'FAIR',
+  '傷や汚れあり': 'FAIR',
+  '全体的に状態が悪い': 'POOR',
+};
+
+function mapCondition(condition) {
+  if (!condition) return null;
+  return MERCARI_CONDITION_TO_ENUM[condition] || null;
+}
+
+// Our scrapers don't carry a marketplace externalId (normalize.js's toItem()
+// only keeps title/price/image/url/condition/source/currency) — FlipRadar's
+// JpSearchItem requires one. Every scraper's url is the real, DOM-verified
+// listing link (never id-constructed — see mercari.js/paypay.js comments), so
+// the trailing /item/<id> or /auction/<id> path segment is a stable,
+// non-invented identifier. Falls back to a short, deterministic hash of the
+// url on the rare listing whose url doesn't match that shape, rather than
+// dropping the item.
+function deriveExternalId(url, internalSource) {
+  if (!url) return `${internalSource}-unknown`;
+  const match = String(url).match(/\/(?:item|auction)\/([^/?#]+)/);
+  if (match) return match[1];
+  return Buffer.from(String(url)).toString('base64url').slice(0, 40);
+}
+
+// Reshapes one already-scraped item (normalize.js's toItem() shape) into
+// FlipRadar's JpSearchItem contract. Fields the scrapers never collected
+// (sellerName/sellerRating/sellerReviewCount/currentBid/auctionEnd — dropped
+// from MVP per .claude/CLAUDE.md, or never scraped) are null, which
+// httpProvider.ts already treats as `?? undefined`.
+function toJapanSearchItem(item, internalSource) {
+  return {
+    source: INTERNAL_TO_MARKETPLACE[internalSource],
+    externalId: deriveExternalId(item.url, internalSource),
+    title: item.title || '',
+    price: typeof item.price === 'number' ? item.price : null,
+    currency: item.currency || 'JPY',
+    url: item.url || null,
+    images: item.image ? [item.image] : [],
+    condition: mapCondition(item.condition),
+    sellerName: null,
+    sellerRating: null,
+    sellerReviewCount: null,
+    listingType: item.mode === 'auction' ? 'AUCTION' : 'BUY_NOW',
+    currentBid: null,
+    bidCount: typeof item.bidCount === 'number' ? item.bidCount : null,
+    auctionEnd: null,
+    sourceCountry: 'JP',
+    isDemo: false,
+    fetchedAt: new Date().toISOString(),
+    availability: 'AVAILABLE',
+  };
+}
+
+// Sentinel distinguishing "this source produced zero results" (still a
+// success — DEGRADED) from "this source timed out or threw after every retry
+// attempt" (ERROR). withTimeout() resolves to the `fallback` value passed to
+// it in BOTH cases (see util/withTimeout.js) without exposing which one
+// happened, so a unique, non-array sentinel is what lets the two be told
+// apart afterwards without touching withTimeout.js itself.
+const SCRAPER_UNAVAILABLE = Symbol('scraper-unavailable');
 // How many sequential page navigations one retry attempt needs for each
 // source. Everyone does a single page.goto; PayPay does homepage-warmup +
 // search (see paypay.skill.md). This feeds computeOuterDeadlineMs() below so
@@ -81,12 +176,37 @@ router.get('/search', searchRateLimiter, async (req, res) => {
   if (!q) return res.status(400).json({ error: 'Missing query param: q' });
   if (q.length > 100) return res.status(400).json({ error: 'Query too long (max 100 chars)' });
 
-  const sourcesParam = String(req.query.sources || ALL_SOURCES.join(','));
-  const sources = sourcesParam
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter((s) => ALL_SOURCES.includes(s));
+  // `marketplaces=MERCARI_JP,YAHOO_AUCTIONS_JP,...` is FlipRadar's param
+  // (emthaoProvider.ts's fetchJapanSearch()); `sources=mercari,yahoo,...`
+  // is the existing emthao-jp-search/frontend's param. Both are accepted;
+  // `marketplaces` takes priority when both are present.
+  const marketplacesParam = req.query.marketplaces != null ? String(req.query.marketplaces).trim() : '';
+  let sources;
+  if (marketplacesParam) {
+    sources = marketplacesParam
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .map((s) => MARKETPLACE_TO_INTERNAL[s])
+      .filter((s) => s && ALL_SOURCES.includes(s));
+  } else {
+    const sourcesParam = String(req.query.sources || ALL_SOURCES.join(','));
+    sources = sourcesParam
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => ALL_SOURCES.includes(s));
+  }
   if (sources.length === 0) return res.status(400).json({ error: 'No valid sources' });
+
+  // Which response shape to build. The existing emthao-jp-search/frontend
+  // (ResultCard.jsx, useSearch.js, BookmarksView.jsx, filters.js, etc.) reads
+  // item.image (singular), item.source (lowercase mercari/yahoo/paypay),
+  // item.mode, item.timeLeft, item.updatedAt, and the raw Japanese
+  // item.condition directly — it does NOT use `marketplaces=`, so detecting
+  // on that param is a safe, request-scoped switch: only requests that
+  // actually ask for the FlipRadar contract get reshaped into it. Requests
+  // using the legacy `sources=` param get the exact original item/response
+  // shape, byte-for-byte, so the existing frontend is completely unaffected.
+  const isFlipRadarContract = Boolean(marketplacesParam);
 
   const limit = Math.max(1, Math.min(40, parseInt(req.query.limit, 10) || 20));
   const page = Math.max(1, Math.min(20, parseInt(req.query.page, 10) || 1));
@@ -95,7 +215,7 @@ router.get('/search', searchRateLimiter, async (req, res) => {
     : 'all';
   const noCache = req.query.nocache === '1' || req.query.nocache === 'true';
 
-  const key = cacheKey({ q, sources, yahooMode, limit, page });
+  const key = cacheKey({ q, sources, yahooMode, limit, page, contract: isFlipRadarContract ? 'flipradar' : 'legacy' });
   if (!noCache) {
     const cached = cache.get(key);
     if (cached) {
@@ -139,7 +259,7 @@ router.get('/search', searchRateLimiter, async (req, res) => {
               }
             ),
             deadlineMs,
-            [],
+            SCRAPER_UNAVAILABLE,
             src
           )
         );
@@ -151,24 +271,68 @@ router.get('/search', searchRateLimiter, async (req, res) => {
     // Otherwise the item order in `results` would silently follow whichever
     // source got launched first, which is a launch-time optimization detail,
     // not something callers should see reflected in response ordering.
-    const resultsBySource = new Map(schedulingOrder.map((src, i) => [src, perScraperResults[i]]));
+    // Each outcome is either the scraper's item array (possibly empty — a
+    // legitimate no-result/known-blocked state, see .claude/CLAUDE.md) or the
+    // SCRAPER_UNAVAILABLE sentinel (every retry attempt failed or timed out).
+    const resultsBySource = new Map();
+    const statusBySource = new Map();
+    schedulingOrder.forEach((src, i) => {
+      const outcome = perScraperResults[i];
+      if (outcome === SCRAPER_UNAVAILABLE) {
+        resultsBySource.set(src, []);
+        statusBySource.set(src, { status: 'ERROR', error: 'Scraper unavailable: every retry attempt failed or timed out.' });
+      } else {
+        resultsBySource.set(src, outcome);
+        statusBySource.set(src, {
+          status: outcome.length ? 'LIVE' : 'DEGRADED',
+          error: outcome.length ? null : 'No results returned for this query.',
+        });
+      }
+    });
 
     // Flatten (in the original requested `sources` order) and dedupe by URL
     // — the dedupe is a defensive guard against scrapers that accidentally
-    // pick up the same listing twice (selector overlap, etc.).
+    // pick up the same listing twice (selector overlap, etc.). Item shape
+    // depends on isFlipRadarContract (see its definition above): the
+    // existing frontend's items are pushed completely unchanged; only
+    // FlipRadar-contract requests get reshaped via toJapanSearchItem().
     const seen = new Set();
     const results = [];
     for (const src of sources) {
       for (const item of resultsBySource.get(src) || []) {
         if (!item.url || seen.has(item.url)) continue;
         seen.add(item.url);
-        results.push(item);
+        results.push(isFlipRadarContract ? toJapanSearchItem(item, src) : item);
       }
     }
+
+    // Heuristic: a source is presumed to have more pages if it came back
+    // with a full page of results. Scrapers don't currently report a real
+    // hasNextPage (see .claude/CLAUDE.md FR-22 — pagination is per-source and
+    // client-driven), so this is the same "Load more" heuristic the existing
+    // frontend already relies on, just exposed on the response for
+    // FlipRadar's JpSearchResponse contract, which requires the field.
+    const hasNextPage = sources.some((src) => (resultsBySource.get(src) || []).length >= limit);
+
+    const sourcesPayload = isFlipRadarContract
+      ? // FlipRadar's JpSearchResponse.sources contract: one entry per
+        // requested marketplace with a health status FlipRadar surfaces
+        // directly (see statusFromHealth() in httpProvider.ts).
+        sources.map((src) => {
+          const st = statusBySource.get(src);
+          return {
+            source: INTERNAL_TO_MARKETPLACE[src],
+            status: st.status,
+            error: st.error,
+            count: (resultsBySource.get(src) || []).length,
+          };
+        })
+      : // Existing emthao-jp-search/frontend shape: unchanged.
+        sources;
+
     const payload = {
       query: q,
       count: results.length,
-      sources,
       page,
       limit,
       cached: false,
@@ -179,6 +343,12 @@ router.get('/search', searchRateLimiter, async (req, res) => {
         defaultWeightKg: pricing.DEFAULT_WEIGHT_KG,
       },
       results,
+      sources: sourcesPayload,
+      // Only added for FlipRadar-contract requests — JpSearchResponse
+      // requires `hasNextPage`, and `unofficial` mirrors services/jp-search's
+      // convention. Omitted (not just falsy) for the legacy shape so the
+      // existing frontend's response stays byte-for-byte identical to before.
+      ...(isFlipRadarContract ? { hasNextPage, unofficial: true } : {}),
     };
     cache.set(key, payload);
     logger.info(

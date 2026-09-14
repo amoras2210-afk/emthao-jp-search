@@ -83,7 +83,11 @@ test('the concurrency limiter is shared across concurrent /search requests (glob
     assert.equal(bodyB.count, 3);
 
     // Historical result order preserved (mercari, yahoo, paypay), even
-    // though scheduling/launch order differs and requests overlap.
+    // though scheduling/launch order differs and requests overlap. This test
+    // uses the legacy `sources=` param (the existing emthao-jp-search/
+    // frontend's param), so items keep their original shape/IDs — see
+    // routes/search.js's isFlipRadarContract switch, which only reshapes
+    // items (to MERCARI_JP-style IDs) for requests using `marketplaces=`.
     assert.deepEqual(bodyA.results.map((r) => r.source), ['mercari', 'yahoo', 'paypay']);
     assert.deepEqual(bodyB.results.map((r) => r.source), ['mercari', 'yahoo', 'paypay']);
 

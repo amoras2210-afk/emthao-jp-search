@@ -7,9 +7,16 @@ const cache = new LRUCache({
   ttl: TTL_MS,
 });
 
-function cacheKey({ q, sources, yahooMode, limit, page }) {
+// `contract` distinguishes the legacy emthao-jp-search/frontend response
+// shape from the FlipRadar JpSearchResponse shape (see routes/search.js's
+// isFlipRadarContract) — the same q/sources/yahooMode/limit/page can be
+// requested through either one, and they return different item/response
+// shapes, so without this a cache hit from one contract could serve the
+// wrong shape to the other. Optional and defaults to '' so the key format
+// for any other future caller that doesn't pass it is unaffected.
+function cacheKey({ q, sources, yahooMode, limit, page, contract = '' }) {
   const sortedSources = [...sources].sort().join(',');
-  return `${q}|${sortedSources}|${yahooMode}|${limit}|p${page || 1}`;
+  return `${q}|${sortedSources}|${yahooMode}|${limit}|p${page || 1}|${contract}`;
 }
 
 // Evict every entry for a given query (across all source/yahooMode/limit/page combos).
