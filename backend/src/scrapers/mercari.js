@@ -7,6 +7,14 @@ const SOURCE = 'mercari';
 const HOST = 'jp.mercari.com';
 const BASE = 'https://jp.mercari.com';
 const API_MATCH = '/v2/entities:search';
+// The search API lives on a separate host from the page itself (jp.mercari.com
+// loads the SPA shell; api.mercari.jp serves the actual search data) — see
+// mercari.skill.md's "no-api-response" maintenance signal. Diagnostic-only
+// listeners below are scoped to this host so a failure there (DNS, connection
+// reset, timeout, 403/429, ...) is distinguishable in logs from a generic
+// "the SPA never called the API" timeout, without changing any scrape
+// behavior, timeout, retry, or concurrency logic.
+const API_HOST = 'api.mercari.jp';
 
 // Mercari item-condition codes → human label (Japanese, as shown on listing).
 const CONDITION_MAP = {
@@ -24,6 +32,55 @@ async function search(context, query, opts = {}) {
   const url = `${BASE}/search?keyword=${encodeURIComponent(query)}`;
   const page = await context.newPage();
   const start = Date.now();
+
+  // --- Diagnostic-only network logging (additive, no behavior change) ---
+  // Purely observational: these listeners never throw, never alter control
+  // flow, and never affect what search() returns. They exist only to turn
+  // "mercari API not observed" (the one error every failed run currently
+  // logs) into a precise network-level reason on the next Render failure —
+  // DNS resolution failure, connection reset/timeout, or an actual HTTP
+  // status (403/429/5xx) from api.mercari.jp — instead of a generic timeout.
+  // Scoped to api.mercari.jp only, and to non-2xx/3xx responses only, to
+  // avoid adding noise for the (expected) successful case. Guarded on
+  // `page.on` existing: the scraper-failure test suite (test/scraper-
+  // failures/_fakeContext.js) doubles `page` with only the methods real
+  // scrapers call, which didn't include `.on()` before — guarding here
+  // keeps this change scoped to this file instead of touching that shared
+  // fixture (also used by yahoo.test.js/paypay.test.js). A real Playwright
+  // page always has `.on`, so this is a no-op in production.
+  if (typeof page.on === 'function') {
+    page.on('requestfailed', (req) => {
+      if (!req.url().includes(API_HOST)) return;
+      const failure = req.failure();
+      logger.warn(
+        {
+          scraper: SOURCE,
+          status: 'api-request-failed',
+          url: req.url(),
+          method: req.method(),
+          resourceType: req.resourceType(),
+          errorText: failure?.errorText || 'unknown',
+          durationMs: Date.now() - start,
+        },
+        'mercari API request failed at network layer'
+      );
+    });
+    page.on('response', (resp) => {
+      if (!resp.url().includes(API_HOST)) return;
+      if (resp.status() < 300) return;
+      logger.warn(
+        {
+          scraper: SOURCE,
+          status: 'api-response-error-status',
+          url: resp.url(),
+          httpStatus: resp.status(),
+          httpStatusText: resp.statusText(),
+          durationMs: Date.now() - start,
+        },
+        'mercari API responded with a non-2xx/3xx status'
+      );
+    });
+  }
 
   try {
     await paceDomain(HOST);
