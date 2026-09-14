@@ -30,16 +30,89 @@ async function search(context, query, opts = {}) {
   const url = buildUrl(query, mode, pageNum, limit);
   const page = await context.newPage();
   const start = Date.now();
+
+  // --- Diagnostic-only instrumentation (additive, no behavior change) ---
+  // Purely observational: never throws, never alters what search() returns,
+  // never changes timeouts/retries. Exists to distinguish, when comparing
+  // Yahoo solo vs Yahoo 3rd-in-request: (A) an abnormally slow goto(), (B) a
+  // goto() that "succeeds" but lands on the wrong page, (C) the real page
+  // loading but .Product never appearing, (D) .Product appearing but a later
+  // step failing, (E) a failed network request to auctions.yahoo.co.jp.
+  // Guarded on each Playwright method existing: the scraper-failure test
+  // suite's fake page (test/scraper-failures/_fakeContext.js) only
+  // implements goto/waitForResponse/waitForSelector/$$eval/evaluate/close —
+  // not on/title/url/locator — so these guards keep this change from
+  // touching that shared fixture (same pattern as mercari.js's 93eaf26).
+  if (typeof page.on === 'function') {
+    page.on('requestfailed', (req) => {
+      if (!req.url().includes(HOST)) return;
+      const failure = req.failure();
+      logger.warn(
+        {
+          scraper: SOURCE,
+          status: 'yahoo-request-failed',
+          url: req.url(),
+          method: req.method(),
+          resourceType: req.resourceType(),
+          errorText: failure?.errorText || 'unknown',
+          durationMs: Date.now() - start,
+        },
+        'yahoo request failed at network layer'
+      );
+    });
+  }
+
   try {
     await paceDomain(HOST);
-    await page.goto(url, { timeout: TIMEOUT_MS, waitUntil: 'domcontentloaded' });
+
+    const gotoStart = Date.now();
+    const gotoResp = await page.goto(url, { timeout: TIMEOUT_MS, waitUntil: 'domcontentloaded' });
+    const gotoEnd = Date.now();
+    logger.info(
+      {
+        scraper: SOURCE,
+        status: 'goto-diagnostic',
+        gotoStart,
+        gotoEnd,
+        gotoDurationMs: gotoEnd - gotoStart,
+        httpStatus: gotoResp ? gotoResp.status() : null,
+        finalUrl: typeof page.url === 'function' ? page.url() : null,
+        pageTitle: typeof page.title === 'function' ? await page.title().catch(() => null) : null,
+      },
+      'yahoo goto complete'
+    );
 
     const remaining = TIMEOUT_MS - (Date.now() - start);
+    const waitStart = Date.now();
     try {
       await page.waitForSelector('li.Product', { timeout: Math.max(1000, remaining) });
+      const waitEnd = Date.now();
+      logger.info(
+        {
+          scraper: SOURCE,
+          status: 'waitforselector-diagnostic',
+          waitStart,
+          waitEnd,
+          waitDurationMs: waitEnd - waitStart,
+          productCount:
+            typeof page.locator === 'function'
+              ? await page.locator('li.Product').count().catch(() => -1)
+              : null,
+        },
+        'yahoo .Product found'
+      );
     } catch {
+      const waitEnd = Date.now();
       logger.warn(
-        { scraper: SOURCE, status: 'no-items', mode, durationMs: Date.now() - start },
+        {
+          scraper: SOURCE,
+          status: 'no-items',
+          mode,
+          durationMs: Date.now() - start,
+          waitStart,
+          waitEnd,
+          waitDurationMs: waitEnd - waitStart,
+        },
         'yahoo .Product not found'
       );
       return [];
