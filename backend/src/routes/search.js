@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const pLimit = require('p-limit');
 const { logger } = require('../logger');
 const { newContext } = require('../browser');
@@ -42,8 +43,40 @@ const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY, 10) || 2;
 // items in `results` below, both stay in the original requested order — the
 // results are re-keyed by source and flattened via `sources`, not this order.
 const SUBMISSION_PRIORITY = { paypay: 0, mercari: 1, yahoo: 2 };
+// Shared by every /search request in this process — created once at module
+// load, NOT per-request. A per-request limiter only caps concurrency within
+// one request's own 3 scrapers: under real concurrent users, N simultaneous
+// requests would each open their own SCRAPE_CONCURRENCY Chromium pages,
+// multiplying total memory use far beyond what SCRAPE_CONCURRENCY was tuned
+// for (Render free tier OOMs above ~2-3 parallel Chromium tabs — see
+// .claude/CLAUDE.md). This module-level limiter makes SCRAPE_CONCURRENCY an
+// actual process-wide cap, regardless of how many requests are in flight.
+const limiter = pLimit(SCRAPE_CONCURRENCY);
 
-router.get('/search', async (req, res) => {
+// Basic per-IP abuse guard on GET /search only — not /health, not
+// DELETE /search/cache. 20 requests/minute is generous for legitimate use
+// (several searches, filter/sort tweaks, "Load more", the odd "Refresh")
+// while still cutting off a scripted loop quickly. This is deliberately NOT
+// the primary defense against resource exhaustion — the module-level
+// `limiter` above already caps real Chromium concurrency process-wide
+// regardless of request volume. This just avoids letting one IP flood the
+// queue and degrade the shared budget for everyone else.
+const SEARCH_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const SEARCH_RATE_LIMIT_MAX = 20;
+const searchRateLimiter = rateLimit({
+  windowMs: SEARCH_RATE_LIMIT_WINDOW_MS,
+  max: SEARCH_RATE_LIMIT_MAX,
+  standardHeaders: true, // RateLimit-Limit / -Remaining / -Reset headers
+  legacyHeaders: false,
+  handler: (req, res, _next, options) => {
+    logger.warn({ ip: req.ip, path: req.path }, 'search rate limit exceeded');
+    res.status(options.statusCode).json({
+      error: 'Too many search requests — please slow down and try again shortly.',
+    });
+  },
+});
+
+router.get('/search', searchRateLimiter, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'Missing query param: q' });
   if (q.length > 100) return res.status(400).json({ error: 'Query too long (max 100 chars)' });
@@ -79,7 +112,6 @@ router.get('/search', async (req, res) => {
     return res.status(500).json({ error: 'Search failed', detail: err.message });
   }
 
-  const limiter = pLimit(SCRAPE_CONCURRENCY);
   // Scheduling order only (see SUBMISSION_PRIORITY above) — `sources` itself
   // (used for the response payload and cache key) stays in its original,
   // requested order.
