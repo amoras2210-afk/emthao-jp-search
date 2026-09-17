@@ -483,15 +483,18 @@ test('mercari.search: a page-error/console message beyond the diagnostic cap is 
   assert.equal(warnCallsForPageError, 20, 'individual page-error log lines must stop at the cap (no flooding)');
 });
 
-// --- Experimental widened waitForResponse() timeout (2026-09-17, NOT the
-// final fix) --- See src/scrapers/mercari.js's MERCARI_API_TIMEOUT_MS
-// comment: Render logs showed /v2/entities:search firing at ~21s in one
-// attempt, after the previous 20000ms waitForResponse() budget had already
-// given up. This constant widens ONLY that wait, to measure on Render
-// whether the call gets reliably captured with more room. page.goto()'s own
-// timeout is a separate, unchanged concern (still TIMEOUT_MS).
+// --- Mercari-specific waitForResponse() timeout (2026-09-17 final design,
+// Option A) --- See src/scrapers/mercari.js's MERCARI_API_TIMEOUT_MS
+// comment: Render logs showed /v2/entities:search consistently firing
+// between ~29.8s and ~32.3s, resolving 0.9-3.4s later (worst observed total
+// ~35.7s). A first experiment at 35000ms still narrowly missed two runs by
+// 181ms/298ms. 40000ms covers the worst observed case with ~4.3s of margin.
+// page.goto()'s own timeout is a separate, unchanged concern (still
+// TIMEOUT_MS/PER_NAV_TIMEOUT_MS, 20000ms). routes/search.js pairs this with
+// exactly 1 retry attempt and an explicit 45000ms outer deadline — see
+// test/unit/searchMercariTiming.test.js for that side of the design.
 
-test('mercari.search: waitForResponse() is called with the widened 35000ms experimental timeout, not the 20000ms nav timeout', async () => {
+test('mercari.search: waitForResponse() is called with the 40000ms MERCARI_API_TIMEOUT_MS, not the 20000ms nav timeout', async () => {
   let capturedTimeout = null;
   const ctx = makeFakeContext({
     waitForResponse: async (_predicate, options) => {
@@ -500,10 +503,11 @@ test('mercari.search: waitForResponse() is called with the widened 35000ms exper
     },
   });
   await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
-  assert.equal(capturedTimeout, 35000, 'waitForResponse() must use the experimental MERCARI_API_TIMEOUT_MS, not the 20000ms nav timeout');
+  assert.equal(capturedTimeout, 40000, 'waitForResponse() must use MERCARI_API_TIMEOUT_MS (40000ms), not the 20000ms nav timeout');
+  assert.equal(capturedTimeout, mercari.MERCARI_API_TIMEOUT_MS, 'must match the exported constant exactly (single source of truth for routes/search.js)');
 });
 
-test('mercari.search: page.goto() keeps its own unrelated 20000ms timeout, unaffected by the waitForResponse experiment', async () => {
+test('mercari.search: page.goto() keeps its own unrelated 20000ms timeout, unaffected by MERCARI_API_TIMEOUT_MS', async () => {
   let capturedGotoTimeout = null;
   const ctx = makeFakeContext({
     goto: async (_url, options) => {
@@ -513,10 +517,10 @@ test('mercari.search: page.goto() keeps its own unrelated 20000ms timeout, unaff
     waitForResponse: async () => null,
   });
   await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
-  assert.equal(capturedGotoTimeout, 20000, 'page.goto() must keep using PER_NAV_TIMEOUT_MS (20000ms), unchanged by this experiment');
+  assert.equal(capturedGotoTimeout, 20000, 'page.goto() must keep using PER_NAV_TIMEOUT_MS (20000ms), unaffected by MERCARI_API_TIMEOUT_MS');
 });
 
-test('mercari.search: a successful scrape within the widened window still resolves normally', async () => {
+test('mercari.search: a successful scrape within the 40s window still resolves normally', async () => {
   const ctx = makeFakeContext({
     waitForResponse: async () => fakeApiResponse({ items: [] }),
   });

@@ -40,7 +40,13 @@ fakeModule('src/browser.js', {
 
 // Mercari fake includes a realistic Japanese condition label + /item/<id> url
 // so externalId derivation and condition mapping can both be exercised.
+// MERCARI_API_TIMEOUT_MS is required here too: routes/search.js reads it at
+// module-load time to compute Mercari's explicit outer deadline (2026-09-17
+// Option A design) — omitting it makes that computation NaN, and
+// setTimeout(fn, NaN) fires almost immediately in Node (see
+// searchGlobalConcurrency.test.js's fuller comment on this).
 fakeModule('src/scrapers/mercari.js', {
+  MERCARI_API_TIMEOUT_MS: 40000,
   search: async (context, q) => [
     {
       title: `mercari-${q}`,

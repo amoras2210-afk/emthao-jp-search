@@ -39,6 +39,13 @@ let maxConcurrentObserved = 0;
 // if the limiter isn't actually enforcing a shared, process-wide cap.
 function fakeScraper(name, delayMs) {
   fakeModule(`src/scrapers/${name}.js`, {
+    // routes/search.js reads mercari.MERCARI_API_TIMEOUT_MS at module-load
+    // time to compute Mercari's explicit outer deadline (2026-09-17 Option A
+    // design) — omitting it here would make that computation NaN, and
+    // setTimeout(fn, NaN) fires essentially immediately in Node, failing
+    // Mercari's withTimeout() long before this fake's delayMs elapses.
+    // Harmless for yahoo/paypay, which never read this field.
+    ...(name === 'mercari' ? { MERCARI_API_TIMEOUT_MS: 40000 } : {}),
     search: async (context, q) => {
       currentConcurrent++;
       maxConcurrentObserved = Math.max(maxConcurrentObserved, currentConcurrent);

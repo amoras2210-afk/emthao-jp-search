@@ -123,6 +123,40 @@ const SCRAPER_UNAVAILABLE = Symbol('scraper-unavailable');
 // per attempt — without it, PayPay's own internal timeout could exceed a
 // deadline sized only for a single navigation.
 const NAVIGATIONS_PER_ATTEMPT = { paypay: 2 };
+// Mercari-only retry/deadline override (2026-09-17). The generic
+// RETRY_ATTEMPTS/computeOuterDeadlineMs formula below assumes every source's
+// per-navigation budget is PER_NAV_TIMEOUT_MS (20000ms) — true for Yahoo/
+// PayPay's page.goto()-bound work, but Mercari's actual bottleneck is its
+// waitForResponse() wait for /v2/entities:search, which needs up to
+// mercari.MERCARI_API_TIMEOUT_MS (40000ms — see mercari.js's own comment for
+// the Render timing evidence behind that number). Retrying Mercari under the
+// generic 20000ms-based formula never produced a second REAL attempt anyway:
+// the shared 45000ms cap always cut attempt 2 off mid page.goto(), before it
+// could even reach its own wait — it only spent the 1000ms retry delay for
+// nothing. So Mercari gets exactly ONE attempt, sized to its own real
+// budget, plus a fixed safety margin for the cleanup that happens between
+// the internal wait expiring and the AbortController firing (page.title()
+// call, log writes).
+//
+// This is deliberately NOT run through computeOuterDeadlineMs(): that
+// function's `maxDeadlineMs` is a ceiling that only caps a raw need FROM
+// ABOVE (Math.min(rawDeadlineMs, maxDeadlineMs)) — it cannot ADD a margin on
+// top of a raw need that's already below the ceiling, which is exactly what
+// Mercari needs here (40000ms of real wait + 5000ms of margin = 45000ms).
+// Passing 40000 as `perNavTimeoutMs` with attempts=1 would just yield 40000
+// (no margin); overloading `perNavTimeoutMs` with 45000 to fake a margin
+// would misname what that parameter means. A direct, explicit sum is the
+// honest computation here — Yahoo/PayPay's own computeOuterDeadlineMs() call
+// below (their real use case: capping a multi-attempt retry sequence) is
+// completely unmodified.
+//
+// The result happens to equal 45000ms — the same number as the existing
+// shared ceiling — but for a reasoned, traceable reason instead of an
+// accident of the generic 20000ms-based formula.
+const MERCARI_ATTEMPTS = 1;
+const MERCARI_DELAYS_MS = [];
+const MERCARI_DEADLINE_SAFETY_MARGIN_MS = 5000;
+const MERCARI_DEADLINE_MS = mercari.MERCARI_API_TIMEOUT_MS + MERCARI_DEADLINE_SAFETY_MARGIN_MS;
 // Concurrency cap on cross-source scrapes. Free tier OOMs at 3 parallel
 // Chromium tabs; 2 leaves room for 2 sources to run at once while the 3rd
 // waits its turn.
@@ -245,9 +279,14 @@ router.get('/search', searchRateLimiter, async (req, res) => {
         // delays) and how many navigations this source needs per attempt —
         // not an independently-picked constant — so it always has room for
         // every attempt retry() might actually make. See scraperTimeout.js.
-        const deadlineMs = computeOuterDeadlineMs({
-          navigationsPerAttempt: NAVIGATIONS_PER_ATTEMPT[src] || 1,
-        });
+        // Mercari is the one exception, using its own explicit
+        // single-attempt budget instead — see MERCARI_DEADLINE_MS above.
+        const deadlineMs =
+          src === 'mercari'
+            ? MERCARI_DEADLINE_MS
+            : computeOuterDeadlineMs({
+                navigationsPerAttempt: NAVIGATIONS_PER_ATTEMPT[src] || 1,
+              });
         // One AbortController per source per request — never shared across
         // sources or reused across requests. When this source's own outer
         // deadline expires, withTimeout() aborts THIS controller only, so
@@ -262,8 +301,8 @@ router.get('/search', searchRateLimiter, async (req, res) => {
             retry(
               () => SCRAPERS[src](context, q, { limit, yahooMode, page, signal: controller.signal }),
               {
-                attempts: RETRY_ATTEMPTS,
-                delays: RETRY_DELAYS_MS,
+                attempts: src === 'mercari' ? MERCARI_ATTEMPTS : RETRY_ATTEMPTS,
+                delays: src === 'mercari' ? MERCARI_DELAYS_MS : RETRY_DELAYS_MS,
                 label: src,
                 signal: controller.signal,
               }
@@ -387,3 +426,9 @@ router.delete('/search/cache', (req, res) => {
 });
 
 module.exports = router;
+// Exposed for unit tests only (routes/search.js's HTTP behavior is otherwise
+// only reachable through the router itself) — proves the Mercari-specific
+// timing override resolves to the intended numbers without needing to time
+// a real request. Reading these has no effect on request handling.
+module.exports.MERCARI_ATTEMPTS = MERCARI_ATTEMPTS;
+module.exports.MERCARI_DEADLINE_MS = MERCARI_DEADLINE_MS;

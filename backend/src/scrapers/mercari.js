@@ -15,17 +15,21 @@ const API_MATCH = '/v2/entities:search';
 // "the SPA never called the API" timeout, without changing any scrape
 // behavior, timeout, retry, or concurrency logic.
 const API_HOST = 'api.mercari.jp';
-// EXPERIMENTAL (2026-09-17, NOT the final fix) — controlled test only.
-// Render logs showed /v2/entities:search fired at ~21s in 1/6 attempts
-// (after our then-20000ms waitForResponse() budget had already given up),
-// with zero pageerror and a correctly-loaded page in every attempt — the
-// evidence points at a timing/budget problem, not a permanent block. This
-// constant ONLY widens waitForResponse()'s own timeout, to measure whether
-// Mercari's search call gets reliably captured given more room. It is
-// deliberately kept below the 45s outer AbortController deadline (untouched)
-// so that deadline still fires and cleans up if this doesn't pan out.
+// Render diagnostics (2026-09-17) showed /v2/entities:search consistently
+// fires between ~29.8s and ~32.3s under Render's CPU-constrained bootstrap,
+// then resolves with a real HTTP 200 0.9-3.4s later — worst observed total
+// ~35.7s. A first experiment at 35000ms still narrowly missed two of four
+// runs (by 181ms and 298ms). 40000ms covers the worst observed case with
+// ~4.3s of margin. routes/search.js gives Mercari exactly ONE retry attempt
+// sized to this budget, with its own outer deadline computed explicitly from
+// this constant (see routes/search.js's MERCARI_DEADLINE_MS) instead of the
+// generic per-source formula, which assumed a 20000ms per-navigation budget
+// and — retrying under it never produced a second REAL Mercari attempt
+// anyway (the old 45000ms cap always cut attempt 2 off mid page.goto()).
 // page.goto()'s own timeout is intentionally NOT changed — still TIMEOUT_MS.
-const MERCARI_API_TIMEOUT_MS = 35000;
+// Exported so routes/search.js can derive its deadline from this exact
+// number rather than duplicating it.
+const MERCARI_API_TIMEOUT_MS = 40000;
 
 // Mercari item-condition codes → human label (Japanese, as shown on listing).
 const CONDITION_MAP = {
@@ -379,4 +383,4 @@ async function search(context, query, opts = {}) {
   }
 }
 
-module.exports = { search };
+module.exports = { search, MERCARI_API_TIMEOUT_MS };
