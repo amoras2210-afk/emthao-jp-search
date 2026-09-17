@@ -6,9 +6,10 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { getEventListeners } = require('node:events');
+const { getEventListeners, EventEmitter } = require('node:events');
 
 const mercari = require('../../src/scrapers/mercari');
+const { logger } = require('../../src/logger');
 const { makeFakeContext } = require('./_fakeContext');
 
 function fakeApiResponse(body) {
@@ -16,6 +17,42 @@ function fakeApiResponse(body) {
     url: () => 'https://api.mercari.jp/v2/entities:search',
     request: () => ({ method: () => 'POST' }),
     json: async () => body,
+  };
+}
+
+// _fakeContext.js's fake page has no `.on()` at all (see its own comment —
+// mercari.js guards every listener registration on `typeof page.on ===
+// 'function'`, exactly so it doesn't need one). These CASE A/B/C/D
+// diagnostic tests are the one place that needs a page which DOES emit
+// events, so this wraps makeFakeContext locally, without touching the
+// shared fixture used by yahoo.test.js/paypay.test.js.
+function makeFakeContextWithEvents(pageOverrides, contextOverrides) {
+  const ctx = makeFakeContext(pageOverrides, contextOverrides);
+  const emitter = new EventEmitter();
+  const realNewPage = ctx.newPage;
+  ctx.newPage = async (...args) => {
+    const page = await realNewPage(...args);
+    page.on = (event, handler) => emitter.on(event, handler);
+    return page;
+  };
+  return { ctx, emitter };
+}
+
+function fakeApiRequest(overrides = {}) {
+  return {
+    url: () => overrides.url || 'https://api.mercari.jp/v2/entities:search',
+    method: () => overrides.method || 'POST',
+    resourceType: () => overrides.resourceType || 'fetch',
+    failure: () => overrides.failure || null,
+  };
+}
+
+function fakeApiResponseEvent(overrides = {}) {
+  return {
+    url: () => overrides.url || 'https://api.mercari.jp/v2/entities:search',
+    status: () => overrides.status ?? 200,
+    statusText: () => overrides.statusText || 'OK',
+    request: () => ({ method: () => overrides.method || 'GET' }),
   };
 }
 
@@ -215,4 +252,104 @@ test('mercari.search: without a signal, behavior is unchanged', async () => {
   });
   const results = await mercari.search(ctx, 'iphone');
   assert.deepEqual(results, []);
+});
+
+// --- CASE A/B/C/D diagnostic listeners (2026-09-17) ---
+// See src/scrapers/mercari.js: the goal is distinguishing "no request to
+// api.mercari.jp was ever sent" (CASE A) from "one was sent but nothing
+// (response or failure) was ever observed for it" (CASE B), on top of the
+// already-existing CASE C (a real response, any status) and CASE D
+// (requestfailed). These tests only check that the new listeners fire
+// correctly and never change search()'s actual outcome — they do not (and
+// cannot, with this fake fixture) reproduce the real Playwright network
+// stack, so they are not a substitute for the Render verification pass.
+
+test('mercari.search: request/requestfinished listeners for api.mercari.jp do not affect a successful scrape', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      // Mirrors the real ordering: request/requestfinished fire around the
+      // same waitForResponse() call that ultimately resolves with the match.
+      emitter.emit('request', fakeApiRequest());
+      emitter.emit('requestfinished', fakeApiRequest());
+      return fakeApiResponse({ items: [] });
+    },
+  });
+  const results = await mercari.search(ctx, 'iphone');
+  assert.deepEqual(results, [], 'the new diagnostic listeners must not change a normal successful outcome');
+});
+
+test('mercari.search: apiRequestsSeen counts only api.mercari.jp requests and is included in the no-api-response log (CASE A/B)', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      // Not api.mercari.jp — must NOT be counted.
+      emitter.emit('request', fakeApiRequest({ url: 'https://jp.mercari.com/some-asset.js' }));
+      // Two real api.mercari.jp requests, neither ever gets a matching
+      // response or failure before the timeout — this is CASE B.
+      emitter.emit('request', fakeApiRequest());
+      emitter.emit('request', fakeApiRequest());
+      return null;
+    },
+  });
+
+  const originalWarn = logger.warn.bind(logger);
+  let captured = null;
+  logger.warn = (obj, msg) => {
+    if (obj && obj.status === 'no-api-response') captured = obj;
+    return originalWarn(obj, msg);
+  };
+  try {
+    await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  } finally {
+    logger.warn = originalWarn;
+  }
+
+  assert.ok(captured, 'the no-api-response log must have been emitted');
+  assert.equal(captured.apiRequestsSeen, 2, 'only the two api.mercari.jp requests must be counted');
+  assert.ok('finalUrl' in captured, 'no-api-response log must include finalUrl');
+  assert.ok('pageTitle' in captured, 'no-api-response log must include pageTitle');
+});
+
+test('mercari.search: no api.mercari.jp request at all leaves apiRequestsSeen at 0 (CASE A)', async () => {
+  const { ctx } = makeFakeContextWithEvents({
+    waitForResponse: async () => null,
+  });
+
+  const originalWarn = logger.warn.bind(logger);
+  let captured = null;
+  logger.warn = (obj, msg) => {
+    if (obj && obj.status === 'no-api-response') captured = obj;
+    return originalWarn(obj, msg);
+  };
+  try {
+    await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  } finally {
+    logger.warn = originalWarn;
+  }
+
+  assert.ok(captured, 'the no-api-response log must have been emitted');
+  assert.equal(captured.apiRequestsSeen, 0, 'no request observed must report apiRequestsSeen: 0');
+});
+
+test('mercari.search: the widened response listener observes a 200 without changing the no-api-response outcome (CASE C)', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      // A real 200 arrives, but on a method our real predicate doesn't match
+      // (GET instead of POST) — the diagnostic listener must observe it
+      // without making waitForResponse() itself resolve. The real
+      // predicate/matching logic in mercari.js is untouched by this test.
+      emitter.emit('response', fakeApiResponseEvent({ status: 200, method: 'GET' }));
+      return null;
+    },
+  });
+  await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+});
+
+test('mercari.search: requestfailed for api.mercari.jp is still observed and does not change the outcome (CASE D)', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      emitter.emit('requestfailed', fakeApiRequest({ failure: { errorText: 'net::ERR_CONNECTION_RESET' } }));
+      return null;
+    },
+  });
+  await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
 });

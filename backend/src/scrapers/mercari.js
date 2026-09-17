@@ -43,6 +43,11 @@ async function search(context, query, opts = {}) {
 
   const page = await context.newPage();
   const start = Date.now();
+  // Count of api.mercari.jp requests observed via the diagnostic `request`
+  // listener below, since the moment this attempt started — see the
+  // 'no-api-response' log further down. Purely observational, never read by
+  // any control-flow decision.
+  let apiRequestsSeen = 0;
 
   // --- Cancellation on the outer per-source deadline (additive) ---
   // When routes/search.js's withTimeout() gives up on this source, it aborts
@@ -68,20 +73,61 @@ async function search(context, query, opts = {}) {
 
   // --- Diagnostic-only network logging (additive, no behavior change) ---
   // Purely observational: these listeners never throw, never alter control
-  // flow, and never affect what search() returns. They exist only to turn
+  // flow, and never affect what search() returns. They exist to turn
   // "mercari API not observed" (the one error every failed run currently
   // logs) into a precise network-level reason on the next Render failure —
-  // DNS resolution failure, connection reset/timeout, or an actual HTTP
-  // status (403/429/5xx) from api.mercari.jp — instead of a generic timeout.
-  // Scoped to api.mercari.jp only, and to non-2xx/3xx responses only, to
-  // avoid adding noise for the (expected) successful case. Guarded on
-  // `page.on` existing: the scraper-failure test suite (test/scraper-
-  // failures/_fakeContext.js) doubles `page` with only the methods real
-  // scrapers call, which didn't include `.on()` before — guarding here
-  // keeps this change scoped to this file instead of touching that shared
-  // fixture (also used by yahoo.test.js/paypay.test.js). A real Playwright
-  // page always has `.on`, so this is a no-op in production.
+  // whether a request to api.mercari.jp was ever sent at all, whether it got
+  // a response (any status) or a network-level failure, or whether it just
+  // never resolved either way — instead of a generic timeout. Scoped to
+  // api.mercari.jp only. Guarded on `page.on` existing: the scraper-failure
+  // test suite (test/scraper-failures/_fakeContext.js) doubles `page` with
+  // only the methods real scrapers call, which didn't include `.on()`
+  // before — guarding here keeps this change scoped to this file instead of
+  // touching that shared fixture (also used by yahoo.test.js/paypay.test.js).
+  // A real Playwright page always has `.on`, so this is a no-op in production.
   if (typeof page.on === 'function') {
+    // --- 2026-09-17: distinguish CASE A (no request ever emitted) from
+    // CASE B (request emitted, never fails or responds) ---
+    // `requestfailed` and the (pre-widen) `response` listener below only
+    // ever fire once Chromium already knows the outcome — neither can fire
+    // in a scenario where a request is either never dispatched at all, or
+    // dispatched and left hanging with no failure/response yet. `request`
+    // is the only event that fires the instant Chromium attempts to send
+    // it, independent of what happens next — it's the missing signal needed
+    // to tell A and B apart on the next Render failure. `requestfinished`
+    // complements `response`/`requestfailed` by confirming the network
+    // exchange fully completed. Both are purely observational: no header,
+    // cookie, or body is read or logged, and neither can throw or alter
+    // control flow.
+    page.on('request', (req) => {
+      if (!req.url().includes(API_HOST)) return;
+      apiRequestsSeen += 1;
+      logger.info(
+        {
+          scraper: SOURCE,
+          status: 'api-request',
+          method: req.method(),
+          url: req.url(),
+          resourceType: req.resourceType(),
+          durationMs: Date.now() - start,
+        },
+        'mercari API request observed'
+      );
+    });
+    page.on('requestfinished', (req) => {
+      if (!req.url().includes(API_HOST)) return;
+      logger.info(
+        {
+          scraper: SOURCE,
+          status: 'api-request-finished',
+          method: req.method(),
+          url: req.url(),
+          resourceType: req.resourceType(),
+          durationMs: Date.now() - start,
+        },
+        'mercari API request finished'
+      );
+    });
     page.on('requestfailed', (req) => {
       if (!req.url().includes(API_HOST)) return;
       const failure = req.failure();
@@ -98,20 +144,33 @@ async function search(context, query, opts = {}) {
         'mercari API request failed at network layer'
       );
     });
+    // Widened for this diagnostic (2026-09-17): log EVERY api.mercari.jp
+    // response, not just >=300, so a real 200 that our waitForResponse()
+    // predicate below simply doesn't match (e.g. a method other than POST)
+    // becomes visible too (CASE C) — this listener is purely observational
+    // and does not touch the real predicate or matching logic in any way.
     page.on('response', (resp) => {
       if (!resp.url().includes(API_HOST)) return;
-      if (resp.status() < 300) return;
-      logger.warn(
-        {
-          scraper: SOURCE,
-          status: 'api-response-error-status',
-          url: resp.url(),
-          httpStatus: resp.status(),
-          httpStatusText: resp.statusText(),
-          durationMs: Date.now() - start,
-        },
-        'mercari API responded with a non-2xx/3xx status'
-      );
+      const isError = resp.status() >= 300;
+      const payload = {
+        scraper: SOURCE,
+        status: isError ? 'api-response-error-status' : 'api-response-observed',
+        url: resp.url(),
+        method: resp.request().method(),
+        httpStatus: resp.status(),
+        httpStatusText: resp.statusText(),
+        durationMs: Date.now() - start,
+      };
+      // Called as logger.warn(...)/logger.info(...) (not extracted into a
+      // bare `const log = ...` reference) — pino's methods rely on `this`
+      // being the logger instance; calling one unbound throws inside this
+      // event handler, which can disrupt Playwright's own event dispatch
+      // (this exact bug was caught by the real integration test below).
+      if (isError) {
+        logger.warn(payload, 'mercari API responded with a non-2xx/3xx status');
+      } else {
+        logger.info(payload, 'mercari API response observed (diagnostic)');
+      }
     });
   }
 
@@ -131,7 +190,20 @@ async function search(context, query, opts = {}) {
     const resp = await apiResponsePromise;
     if (!resp) {
       logger.warn(
-        { scraper: SOURCE, status: 'no-api-response', durationMs: Date.now() - start },
+        {
+          scraper: SOURCE,
+          status: 'no-api-response',
+          durationMs: Date.now() - start,
+          // apiRequestsSeen === 0 here means the browser never even attempted
+          // to send a request to api.mercari.jp (CASE A); >= 1 means one was
+          // sent but never got a matching response/failure before this point
+          // (CASE B) — see the `request` listener above. finalUrl/pageTitle
+          // mirror yahoo.js's same diagnostic pattern, to catch a silent
+          // redirect or degraded page (CASE F).
+          apiRequestsSeen,
+          finalUrl: typeof page.url === 'function' ? page.url() : null,
+          pageTitle: typeof page.title === 'function' ? await page.title().catch(() => null) : null,
+        },
         'mercari API not observed'
       );
       // Mercari's SPA fires this API call for every search, including 0-result ones —
