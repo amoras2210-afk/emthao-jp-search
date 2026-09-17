@@ -4,9 +4,11 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { getEventListeners } = require('node:events');
 
 const yahoo = require('../../src/scrapers/yahoo');
 const { logger } = require('../../src/logger');
+const { retry } = require('../../src/util/retry');
 const { makeFakeContext } = require('./_fakeContext');
 
 // _fakeContext.js's fake page has no `.title()`/`.url()` at all (yahoo.js
@@ -260,4 +262,151 @@ test('yahoo.search: no unhandled rejection even when waitForSelector rejects whi
 
   assert.deepEqual(results, [], 'the pre-existing no-items behavior must be unchanged');
   assert.deepEqual(unhandled, [], 'an early waitForSelector rejection must never surface as an unhandled rejection');
+});
+
+// --- Cancellation via opts.signal (2026-09-17 Yahoo/PayPay AbortController
+// fix) --- See src/scrapers/yahoo.js: this reuses the exact same pattern
+// mercari.js already had (see mercari.test.js's own "Cancellation via
+// opts.signal" section) — closing the page immediately on abort instead of
+// waiting out its own internal navigation timeout. These fakes emulate the
+// one real-Playwright contract this relies on — closing a page rejects its
+// pending goto — since the shared _fakeContext.js double does not model that
+// on its own.
+
+test('yahoo.search: on abort, closes the page promptly and rejects without waiting for a hung navigation', async () => {
+  let closeCalls = 0;
+  let rejectGoto;
+  const gotoPromise = new Promise((_resolve, reject) => {
+    rejectGoto = reject;
+  });
+  const controller = new AbortController();
+  let gotoInvokedAt = null;
+
+  const ctx = makeFakeContext({
+    // Abort right as the (hung) navigation begins, via queueMicrotask rather
+    // than a fixed wall-clock delay — same reasoning as mercari.test.js:
+    // paceDomain() can impose a real ≥1s per-host wait BEFORE goto() is even
+    // called, so a fixed setTimeout would race unpredictably against it.
+    goto: () => {
+      gotoInvokedAt = Date.now();
+      queueMicrotask(() => controller.abort());
+      return gotoPromise;
+    },
+    close: async () => {
+      closeCalls++;
+      rejectGoto(new Error('Target page, context or browser has been closed'));
+    },
+  });
+
+  const searchPromise = yahoo.search(ctx, 'iphone', { signal: controller.signal });
+
+  await assert.rejects(() => searchPromise);
+
+  // Measured from when goto() actually started, not from search()'s own
+  // start — see mercari.test.js's identical note about paceDomain().
+  const elapsedSinceGoto = Date.now() - gotoInvokedAt;
+  assert.ok(closeCalls >= 1, 'page.close() must be called at least once on abort');
+  assert.ok(
+    elapsedSinceGoto < 500,
+    `search() must reject shortly after abort, not hang for a full internal timeout (took ${elapsedSinceGoto}ms since goto() started)`
+  );
+});
+
+test('yahoo.search: removes its abort listener when finishing normally (no leak)', async () => {
+  const ctx = makeFakeContext({ $$eval: fakeOneItem$$eval });
+  const controller = new AbortController();
+  await yahoo.search(ctx, 'iphone', { signal: controller.signal });
+  assert.equal(
+    getEventListeners(controller.signal, 'abort').length,
+    0,
+    'search() must remove its abort listener once it settles, success or failure'
+  );
+});
+
+test('yahoo.search: removes its abort listener even when the scrape fails (no leak on the error path)', async () => {
+  const ctx = makeFakeContext({
+    goto: async () => {
+      throw new Error('page.goto: Timeout 12000ms exceeded');
+    },
+  });
+  const controller = new AbortController();
+  await assert.rejects(() => yahoo.search(ctx, 'iphone', { signal: controller.signal }));
+  assert.equal(
+    getEventListeners(controller.signal, 'abort').length,
+    0,
+    'the abort listener must be removed on the error path too'
+  );
+});
+
+test('yahoo.search: never opens a page if the signal is already aborted before start', async () => {
+  const ctx = makeFakeContext({});
+  let newPageCalls = 0;
+  const realNewPage = ctx.newPage;
+  ctx.newPage = async (...args) => {
+    newPageCalls++;
+    return realNewPage(...args);
+  };
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () => yahoo.search(ctx, 'iphone', { signal: controller.signal }),
+    /aborted before start/
+  );
+  assert.equal(newPageCalls, 0, 'context.newPage() must never be called once the signal is already aborted');
+});
+
+test('yahoo.search: without a signal, behavior is unchanged', async () => {
+  const ctx = makeFakeContext({ $$eval: fakeOneItem$$eval });
+  const results = await yahoo.search(ctx, 'iphone');
+  assert.equal(results.length, 1);
+  assert.equal(results[0].title, 'Louis Vuitton Test Item');
+});
+
+test('yahoo.search: a legitimate empty result (.Product never renders) stays [] even when a signal is provided and never aborts', async () => {
+  const ctx = makeFakeContext({
+    waitForSelector: async () => {
+      throw new Error('Timeout waiting for selector "li.Product"');
+    },
+  });
+  const controller = new AbortController();
+  const results = await yahoo.search(ctx, 'iphone', { signal: controller.signal });
+  assert.deepEqual(results, []);
+  assert.equal(
+    getEventListeners(controller.signal, 'abort').length,
+    0,
+    'the abort listener must still be cleaned up on the empty-result path'
+  );
+});
+
+test('yahoo.search + retry(): an abort mid-flight does not trigger a further retry attempt', async () => {
+  let gotoCalls = 0;
+  let rejectGoto;
+  const controller = new AbortController();
+  const ctx = makeFakeContext({
+    goto: () => {
+      gotoCalls++;
+      queueMicrotask(() => controller.abort());
+      return new Promise((_resolve, reject) => {
+        rejectGoto = reject;
+      });
+    },
+    close: async () => {
+      if (rejectGoto) rejectGoto(new Error('Target page, context or browser has been closed'));
+    },
+  });
+
+  await assert.rejects(() =>
+    retry(() => yahoo.search(ctx, 'iphone', { signal: controller.signal }), {
+      attempts: 3,
+      delays: [10, 10],
+      label: 'yahoo',
+      signal: controller.signal,
+    })
+  );
+
+  assert.equal(
+    gotoCalls,
+    1,
+    'an abort must not cause retry() to launch a further attempt — retry() checks signal.aborted before each attempt, so a cancelled scrape must not be treated like an ordinary retryable network error'
+  );
 });

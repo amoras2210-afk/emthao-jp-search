@@ -21,11 +21,49 @@ const GEO_FAIL_MARKERS = ['データの取得に失敗しました', 'あなた�
 
 async function search(context, query, opts = {}) {
   const limit = opts.limit ?? 20;
+  const { signal } = opts;
   const url = `${BASE}/search/${encodeURIComponent(query)}`;
+
+  // If the outer deadline (routes/search.js) already gave up on THIS attempt
+  // before we even got here (e.g. it aborted while we were still queued
+  // behind context.newPage()'s own await), don't bother opening a Chromium
+  // page at all — retry() also won't launch a further attempt once it sees
+  // signal.aborted (see retry.js), so there is nothing left to wait for.
+  // Same pattern as mercari.js.
+  if (signal?.aborted) {
+    throw new Error('paypay scrape aborted before start (outer deadline already expired)');
+  }
+
   const page = await context.newPage();
   const start = Date.now();
   const cachedCookies = getCachedCookies();
   const usedCachedCookies = !!(cachedCookies && cachedCookies.length > 0);
+
+  // --- Cancellation on the outer per-source deadline (additive) ---
+  // Same pattern as mercari.js's 2026-09-17 fix: without this, an in-flight
+  // page.goto()/waitForSelector()/context.request.get() kept running for its
+  // own internal timeout after routes/search.js's withTimeout() had already
+  // given up on this source and freed the SCRAPE_CONCURRENCY slot — a zombie
+  // page holding Chromium/CPU while the NEXT source (or a new request)
+  // started. Closing the page here makes any pending page.goto/
+  // waitForSelector/$$eval on it reject almost immediately instead of
+  // waiting out their own timeout. Does NOT cover the lightweight HTTP
+  // warmup (`context.request.get`, not tied to any page) — see the note
+  // below where that call is made.
+  // `{ once: true }` plus the `finally` removeEventListener below means this
+  // never fires more than once and never leaks past this call.
+  const onAbort = () => {
+    page.close().catch(() => {});
+  };
+  if (signal) {
+    if (signal.aborted) {
+      // Aborted in the gap between the check above and page creation.
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
   try {
     // Homepage warmup. Without a prior hit on the Yahoo!フリマ domain, /search/<q>
     // returns 404 + the "データの取得に失敗しました" banner from non-JP IPs (the SPA's
@@ -183,6 +221,10 @@ async function search(context, query, opts = {}) {
     // both are treated as a genuine zero-result search, not a block.
     throw err;
   } finally {
+    if (signal) signal.removeEventListener('abort', onAbort);
+    // Unchanged from before: safe even if onAbort() already closed the page
+    // (Playwright tolerates closing an already-closing/closed page, and
+    // .catch(() => {}) swallows either way).
     await page.close().catch(() => {});
   }
 }

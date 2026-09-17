@@ -59,9 +59,43 @@ async function search(context, query, opts = {}) {
   const limit = opts.limit ?? 20;
   const pageNum = Math.max(1, opts.page || 1);
   const mode = opts.yahooMode || 'all';
+  const { signal } = opts;
   const url = buildUrl(query, mode, pageNum, limit);
+
+  // If the outer deadline (routes/search.js) already gave up on THIS attempt
+  // before we even got here (e.g. it aborted while we were still queued
+  // behind context.newPage()'s own await), don't bother opening a Chromium
+  // page at all — retry() also won't launch a further attempt once it sees
+  // signal.aborted (see retry.js), so there is nothing left to wait for.
+  // Same pattern as mercari.js.
+  if (signal?.aborted) {
+    throw new Error('yahoo scrape aborted before start (outer deadline already expired)');
+  }
+
   const page = await context.newPage();
   const start = Date.now();
+
+  // --- Cancellation on the outer per-source deadline (additive) ---
+  // Same pattern as mercari.js's 2026-09-17 fix: without this, an in-flight
+  // page.goto()/waitForSelector() kept running for its own internal timeout
+  // after routes/search.js's withTimeout() had already given up on this
+  // source and freed the SCRAPE_CONCURRENCY slot — a zombie page holding
+  // Chromium/CPU while the NEXT source (or a new request) started. Closing
+  // the page here makes any pending goto/waitForSelector/$$eval on it reject
+  // almost immediately instead of waiting out their own timeout.
+  // `{ once: true }` plus the `finally` removeEventListener below means this
+  // never fires more than once and never leaks past this call.
+  const onAbort = () => {
+    page.close().catch(() => {});
+  };
+  if (signal) {
+    if (signal.aborted) {
+      // Aborted in the gap between the check above and page creation.
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
 
   // --- Diagnostic-only instrumentation (additive, no behavior change) ---
   // Purely observational: never throws, never alters what search() returns,
@@ -248,6 +282,10 @@ async function search(context, query, opts = {}) {
     // [] without throwing.
     throw err;
   } finally {
+    if (signal) signal.removeEventListener('abort', onAbort);
+    // Unchanged from before: safe even if onAbort() already closed the page
+    // (Playwright tolerates closing an already-closing/closed page, and
+    // .catch(() => {}) swallows either way).
     await page.close().catch(() => {});
   }
 }
