@@ -14,9 +14,23 @@ const cache = new LRUCache({
 // shapes, so without this a cache hit from one contract could serve the
 // wrong shape to the other. Optional and defaults to '' so the key format
 // for any other future caller that doesn't pass it is unaffected.
+//
+// `sources` is joined in the order it was given — deliberately NOT sorted.
+// routes/search.js echoes `sources` back in the cached payload (the
+// `sources` field, and the order items are flattened into `results`) in
+// exactly the order the ORIGINAL request asked for. A sorted key made two
+// requests for the same source set but a different order (e.g.
+// `mercari,yahoo` vs `yahoo,mercari`) collide on one cache entry, so the
+// second request silently got back the first request's order instead of
+// its own (2026-09-17 audit finding, reproduced against the real
+// routes/search.js). Not sorting means those two orders now get their own
+// cache entries — a request's cached response always matches the order it
+// actually asked for. The only cost is one extra scrape the first time a
+// new order is seen for the same source set, same as any other cache-key
+// dimension (limit/page/yahooMode) already works.
 function cacheKey({ q, sources, yahooMode, limit, page, contract = '' }) {
-  const sortedSources = [...sources].sort().join(',');
-  return `${q}|${sortedSources}|${yahooMode}|${limit}|p${page || 1}|${contract}`;
+  const sourcesKey = sources.join(',');
+  return `${q}|${sourcesKey}|${yahooMode}|${limit}|p${page || 1}|${contract}`;
 }
 
 // Evict every entry for a given query (across all source/yahooMode/limit/page combos).
