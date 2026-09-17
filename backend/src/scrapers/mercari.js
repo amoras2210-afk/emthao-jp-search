@@ -29,9 +29,42 @@ const CONDITION_MAP = {
 async function search(context, query, opts = {}) {
   const limit = opts.limit ?? 20;
   const pageNum = Math.max(1, opts.page || 1);
+  const { signal } = opts;
   const url = `${BASE}/search?keyword=${encodeURIComponent(query)}`;
+
+  // If the outer deadline (routes/search.js) already gave up on THIS attempt
+  // before we even got here (e.g. it aborted while we were still queued
+  // behind context.newPage()'s own await), don't bother opening a Chromium
+  // page at all — retry() also won't launch a further attempt once it sees
+  // signal.aborted (see retry.js), so there is nothing left to wait for.
+  if (signal?.aborted) {
+    throw new Error('mercari scrape aborted before start (outer deadline already expired)');
+  }
+
   const page = await context.newPage();
   const start = Date.now();
+
+  // --- Cancellation on the outer per-source deadline (additive) ---
+  // When routes/search.js's withTimeout() gives up on this source, it aborts
+  // `signal` — see 2026-09-17 incident: without this, an in-flight
+  // page.goto()/waitForResponse() kept running for its own ~20s internal
+  // timeout, holding a Chromium page open (and using CPU) while the NEXT
+  // source (Yahoo) had already started, even under SCRAPE_CONCURRENCY=1.
+  // Closing the page here makes any pending goto/waitForResponse on it
+  // reject almost immediately instead of waiting out their own timeout.
+  // `{ once: true }` plus the `finally` removeEventListener below means this
+  // never fires more than once and never leaks past this call.
+  const onAbort = () => {
+    page.close().catch(() => {});
+  };
+  if (signal) {
+    if (signal.aborted) {
+      // Aborted in the gap between the check above and page creation.
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
 
   // --- Diagnostic-only network logging (additive, no behavior change) ---
   // Purely observational: these listeners never throw, never alter control
@@ -176,6 +209,10 @@ async function search(context, query, opts = {}) {
     // genuinely empty search never reaches here — it returns [] above without throwing.
     throw err;
   } finally {
+    if (signal) signal.removeEventListener('abort', onAbort);
+    // Unchanged from before: safe even if onAbort() already closed the page
+    // (Playwright tolerates closing an already-closing/closed page, and
+    // .catch(() => {}) swallows either way).
     await page.close().catch(() => {});
   }
 }

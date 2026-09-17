@@ -248,19 +248,30 @@ router.get('/search', searchRateLimiter, async (req, res) => {
         const deadlineMs = computeOuterDeadlineMs({
           navigationsPerAttempt: NAVIGATIONS_PER_ATTEMPT[src] || 1,
         });
+        // One AbortController per source per request — never shared across
+        // sources or reused across requests. When this source's own outer
+        // deadline expires, withTimeout() aborts THIS controller only, so
+        // retry()/the scraper for this source can stop promptly instead of
+        // leaving an orphaned Chromium page running (see 2026-09-17 incident:
+        // an abandoned Mercari attempt kept a page open during Yahoo's own
+        // navigation, despite SCRAPE_CONCURRENCY=1). Aborting one source's
+        // controller can never affect another source's controller/signal.
+        const controller = new AbortController();
         return limiter(() =>
           withTimeout(
             retry(
-              () => SCRAPERS[src](context, q, { limit, yahooMode, page }),
+              () => SCRAPERS[src](context, q, { limit, yahooMode, page, signal: controller.signal }),
               {
                 attempts: RETRY_ATTEMPTS,
                 delays: RETRY_DELAYS_MS,
                 label: src,
+                signal: controller.signal,
               }
             ),
             deadlineMs,
             SCRAPER_UNAVAILABLE,
-            src
+            src,
+            controller
           )
         );
       })
