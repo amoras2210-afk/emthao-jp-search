@@ -48,6 +48,14 @@ async function search(context, query, opts = {}) {
   // 'no-api-response' log further down. Purely observational, never read by
   // any control-flow decision.
   let apiRequestsSeen = 0;
+  // Counts for the console/pageerror listeners below — same purely
+  // observational role as apiRequestsSeen, surfaced in the 'no-api-response'
+  // summary log. Never read by any control-flow decision.
+  let consoleMessagesSeen = 0;
+  let pageErrorsSeen = 0;
+  // Safety cap so a chatty/broken page can't flood the logs — counters above
+  // still track the true total regardless of this cap.
+  const DIAGNOSTIC_LOG_CAP = 20;
 
   // --- Cancellation on the outer per-source deadline (additive) ---
   // When routes/search.js's withTimeout() gives up on this source, it aborts
@@ -172,6 +180,47 @@ async function search(context, query, opts = {}) {
         logger.info(payload, 'mercari API response observed (diagnostic)');
       }
     });
+    // --- 2026-09-17: was the page's own JS ever going to fire the search
+    // call at all? ---
+    // The network listeners above proved api.mercari.jp itself is reachable
+    // and responsive from Render (other endpoints return clean 200s) while
+    // /v2/entities:search is never requested — so the next question is
+    // whether Mercari's client-side bootstrap hits a JS error or reports
+    // something relevant via console before ever reaching the point where it
+    // would fire that call. Purely observational: never throws, never reads
+    // cookies/headers/bodies, never alters control flow. Only 'error',
+    // 'warning', and 'assert' console message types are logged (not
+    // 'log'/'info'/'debug') to stay close to "relevant" without flooding.
+    page.on('console', (msg) => {
+      const type = typeof msg.type === 'function' ? msg.type() : null;
+      if (type !== 'error' && type !== 'warning' && type !== 'assert') return;
+      consoleMessagesSeen += 1;
+      if (consoleMessagesSeen > DIAGNOSTIC_LOG_CAP) return;
+      logger.info(
+        {
+          scraper: SOURCE,
+          status: 'console-message',
+          type,
+          text: typeof msg.text === 'function' ? msg.text() : null,
+          durationMs: Date.now() - start,
+        },
+        'mercari page console message'
+      );
+    });
+    page.on('pageerror', (err) => {
+      pageErrorsSeen += 1;
+      if (pageErrorsSeen > DIAGNOSTIC_LOG_CAP) return;
+      logger.warn(
+        {
+          scraper: SOURCE,
+          status: 'page-error',
+          name: err?.name || null,
+          message: err?.message || String(err),
+          durationMs: Date.now() - start,
+        },
+        'mercari page threw an unhandled error'
+      );
+    });
   }
 
   try {
@@ -185,7 +234,29 @@ async function search(context, query, opts = {}) {
       )
       .catch(() => null);
 
-    await page.goto(url, { timeout: TIMEOUT_MS, waitUntil: 'domcontentloaded' });
+    const gotoStart = Date.now();
+    const gotoResp = await page.goto(url, { timeout: TIMEOUT_MS, waitUntil: 'domcontentloaded' });
+    // Minimal progress log (2026-09-17), mirroring yahoo.js's own
+    // goto-diagnostic: an early, independent snapshot of finalUrl/pageTitle
+    // right after the page shell loads — separate from the (unchanged) live
+    // snapshot taken at the no-api-response point below, so a later
+    // client-side redirect/degradation between the two becomes visible.
+    logger.info(
+      {
+        scraper: SOURCE,
+        status: 'goto-diagnostic',
+        gotoDurationMs: Date.now() - gotoStart,
+        httpStatus: gotoResp ? gotoResp.status() : null,
+        finalUrl: typeof page.url === 'function' ? page.url() : null,
+        pageTitle: typeof page.title === 'function' ? await page.title().catch(() => null) : null,
+      },
+      'mercari goto complete'
+    );
+
+    logger.info(
+      { scraper: SOURCE, status: 'api-wait-start', durationMs: Date.now() - start },
+      'mercari waiting for API response'
+    );
 
     const resp = await apiResponsePromise;
     if (!resp) {
@@ -197,10 +268,16 @@ async function search(context, query, opts = {}) {
           // apiRequestsSeen === 0 here means the browser never even attempted
           // to send a request to api.mercari.jp (CASE A); >= 1 means one was
           // sent but never got a matching response/failure before this point
-          // (CASE B) — see the `request` listener above. finalUrl/pageTitle
+          // (CASE B) — see the `request` listener above. consoleMessagesSeen/
+          // pageErrorsSeen (2026-09-17) add whether the page's own JS
+          // reported anything relevant before giving up. finalUrl/pageTitle
           // mirror yahoo.js's same diagnostic pattern, to catch a silent
-          // redirect or degraded page (CASE F).
+          // redirect or degraded page (CASE F) — this is a fresh, live
+          // snapshot at the point of failure, independent of the
+          // goto-diagnostic snapshot taken right after navigation above.
           apiRequestsSeen,
+          consoleMessagesSeen,
+          pageErrorsSeen,
           finalUrl: typeof page.url === 'function' ? page.url() : null,
           pageTitle: typeof page.title === 'function' ? await page.title().catch(() => null) : null,
         },

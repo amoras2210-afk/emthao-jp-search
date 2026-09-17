@@ -56,6 +56,10 @@ function fakeApiResponseEvent(overrides = {}) {
   };
 }
 
+function fakeConsoleMessage(type, text) {
+  return { type: () => type, text: () => text };
+}
+
 test('mercari.search: rethrows on navigation failure (retryable)', async () => {
   const ctx = makeFakeContext({
     goto: async () => {
@@ -352,4 +356,129 @@ test('mercari.search: requestfailed for api.mercari.jp is still observed and doe
     },
   });
   await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+});
+
+// --- console/pageerror listeners + goto/api-wait progress logs (2026-09-17) ---
+// See src/scrapers/mercari.js: the question here is whether Mercari's own
+// client-side JS ever gets far enough to attempt /v2/entities:search, or
+// throws/reports something before that. These tests only check the new
+// listeners fire correctly and never change search()'s actual outcome.
+
+test('mercari.search: a successful scrape is unaffected by console/pageerror listeners and the new progress logs', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    goto: async () => {
+      emitter.emit('console', fakeConsoleMessage('log', 'ignored — not a relevant type'));
+      return { status: () => 200 };
+    },
+    waitForResponse: async () => fakeApiResponse({ items: [] }),
+  });
+  const results = await mercari.search(ctx, 'iphone');
+  assert.deepEqual(results, [], 'the new listeners/logs must not change a normal successful outcome');
+});
+
+test('mercari.search: only relevant console types (error/warning/assert) are counted, "log"/"info" are ignored', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      emitter.emit('console', fakeConsoleMessage('log', 'noisy debug line'));
+      emitter.emit('console', fakeConsoleMessage('info', 'noisy info line'));
+      emitter.emit('console', fakeConsoleMessage('error', 'a real page error message'));
+      emitter.emit('console', fakeConsoleMessage('warning', 'a real page warning'));
+      return null;
+    },
+  });
+
+  const originalWarn = logger.warn.bind(logger);
+  let captured = null;
+  logger.warn = (obj, msg) => {
+    if (obj && obj.status === 'no-api-response') captured = obj;
+    return originalWarn(obj, msg);
+  };
+  try {
+    await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  } finally {
+    logger.warn = originalWarn;
+  }
+
+  assert.ok(captured, 'the no-api-response log must have been emitted');
+  assert.equal(captured.consoleMessagesSeen, 2, 'only "error" and "warning" must be counted, not "log"/"info"');
+});
+
+test('mercari.search: pageerror events are counted and included in the no-api-response summary', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      emitter.emit('pageerror', Object.assign(new Error('boom in page JS'), { name: 'TypeError' }));
+      emitter.emit('pageerror', Object.assign(new Error('boom again'), { name: 'ReferenceError' }));
+      return null;
+    },
+  });
+
+  const originalWarn = logger.warn.bind(logger);
+  let captured = null;
+  logger.warn = (obj, msg) => {
+    if (obj && obj.status === 'no-api-response') captured = obj;
+    return originalWarn(obj, msg);
+  };
+  try {
+    await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  } finally {
+    logger.warn = originalWarn;
+  }
+
+  assert.ok(captured, 'the no-api-response log must have been emitted');
+  assert.equal(captured.pageErrorsSeen, 2, 'both pageerror events must be counted');
+});
+
+test('mercari.search: emits a goto-diagnostic log with finalUrl/pageTitle/httpStatus right after navigation', async () => {
+  const ctx = makeFakeContext({
+    goto: async () => ({ status: () => 200 }),
+    waitForResponse: async () => null,
+  });
+
+  const originalInfo = logger.info.bind(logger);
+  let captured = null;
+  logger.info = (obj, msg) => {
+    if (obj && obj.status === 'goto-diagnostic') captured = obj;
+    return originalInfo(obj, msg);
+  };
+  try {
+    await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  } finally {
+    logger.info = originalInfo;
+  }
+
+  assert.ok(captured, 'a goto-diagnostic log must be emitted right after page.goto() resolves');
+  assert.equal(captured.httpStatus, 200);
+  // The shared fake page has no .url()/.title() — both must degrade to null,
+  // not throw (same guarded pattern already used at no-api-response).
+  assert.equal(captured.finalUrl, null);
+  assert.equal(captured.pageTitle, null);
+});
+
+test('mercari.search: a page-error/console message beyond the diagnostic cap is counted but not logged (no flooding)', async () => {
+  const { ctx, emitter } = makeFakeContextWithEvents({
+    waitForResponse: async () => {
+      for (let i = 0; i < 25; i++) {
+        emitter.emit('pageerror', new Error(`error #${i}`));
+      }
+      return null;
+    },
+  });
+
+  const originalWarn = logger.warn.bind(logger);
+  let captured = null;
+  let warnCallsForPageError = 0;
+  logger.warn = (obj, msg) => {
+    if (obj && obj.status === 'page-error') warnCallsForPageError++;
+    if (obj && obj.status === 'no-api-response') captured = obj;
+    return originalWarn(obj, msg);
+  };
+  try {
+    await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  } finally {
+    logger.warn = originalWarn;
+  }
+
+  assert.ok(captured, 'the no-api-response log must have been emitted');
+  assert.equal(captured.pageErrorsSeen, 25, 'the true total must still be counted past the cap');
+  assert.equal(warnCallsForPageError, 20, 'individual page-error log lines must stop at the cap (no flooding)');
 });
