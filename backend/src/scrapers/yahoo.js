@@ -8,6 +8,38 @@ const { PER_NAV_TIMEOUT_MS: TIMEOUT_MS } = require('../util/scraperTimeout');
 const SOURCE = 'yahoo';
 const HOST = 'auctions.yahoo.co.jp';
 const BASE = 'https://auctions.yahoo.co.jp';
+// Diagnostic-only cap for the (async, browser-round-trip) page.title() call
+// below — see the 2026-09-17 incident: page.title() was observed taking
+// ~12.2s under Render CPU load, sitting between goto() and waitForSelector()
+// in sequence, silently consuming most of the functional wait budget and
+// causing a false "no-items" result on an otherwise successful page.
+// page.waitForSelector() is now CALLED (its own internal timeout clock
+// starts) BEFORE this diagnostic is ever awaited, so this can no longer
+// delay the functional path — see search() below. 500ms is generous for a
+// same-page round trip and small enough to never matter next to the ~20s
+// functional budget it now runs concurrently with, not before.
+const DIAGNOSTIC_TITLE_TIMEOUT_MS = 500;
+
+// Resolves to `null` — never rejects — if `promise` doesn't settle within
+// `ms`, or if it rejects on its own (e.g. the page closed mid-flight).
+// Diagnostic-only: deliberately separate from util/withTimeout.js, which
+// wraps a whole scraper attempt for retry()/routes/search.js — this is a
+// purely local, best-effort helper for one non-blocking logging value.
+function withDiagnosticTimeout(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      }
+    );
+  });
+}
 
 function buildUrl(query, mode, page, limit) {
   let url = `${BASE}/search/search?p=${encodeURIComponent(query)}&va=${encodeURIComponent(query)}`;
@@ -68,6 +100,32 @@ async function search(context, query, opts = {}) {
     const gotoStart = Date.now();
     const gotoResp = await page.goto(url, { timeout: TIMEOUT_MS, waitUntil: 'domcontentloaded' });
     const gotoEnd = Date.now();
+    // page.url() is synchronous (cached from the last navigation, no browser
+    // round trip) — safe to read immediately, unlike page.title() below.
+    const finalUrl = typeof page.url === 'function' ? page.url() : null;
+
+    const remaining = TIMEOUT_MS - (Date.now() - start);
+    const waitStart = Date.now();
+    // CALLED here, immediately after goto — its internal timeout clock
+    // starts ticking now, BEFORE the diagnostic page.title() fetch below is
+    // ever awaited, so that fetch can never delay this. Not awaited yet.
+    const waitForSelectorPromise = page.waitForSelector('li.Product', { timeout: Math.max(1000, remaining) });
+    // A second handler on the same promise, attached immediately, so Node
+    // never treats it as an unhandled rejection during the short window
+    // before the try/catch below actually awaits it (right after the title
+    // diagnostic). This does not consume or alter the rejection the
+    // try/catch observes — multiple handlers on one promise are independent.
+    waitForSelectorPromise.catch(() => {});
+
+    // Diagnostic-only, capped and non-blocking (see DIAGNOSTIC_TITLE_TIMEOUT_MS
+    // above) — runs concurrently with waitForSelectorPromise, which is
+    // already in flight by this point, so this can add at most its own
+    // short ceiling, never stack on top of the functional wait.
+    const pageTitle =
+      typeof page.title === 'function'
+        ? await withDiagnosticTimeout(page.title(), DIAGNOSTIC_TITLE_TIMEOUT_MS)
+        : null;
+
     logger.info(
       {
         scraper: SOURCE,
@@ -76,16 +134,14 @@ async function search(context, query, opts = {}) {
         gotoEnd,
         gotoDurationMs: gotoEnd - gotoStart,
         httpStatus: gotoResp ? gotoResp.status() : null,
-        finalUrl: typeof page.url === 'function' ? page.url() : null,
-        pageTitle: typeof page.title === 'function' ? await page.title().catch(() => null) : null,
+        finalUrl,
+        pageTitle,
       },
       'yahoo goto complete'
     );
 
-    const remaining = TIMEOUT_MS - (Date.now() - start);
-    const waitStart = Date.now();
     try {
-      await page.waitForSelector('li.Product', { timeout: Math.max(1000, remaining) });
+      await waitForSelectorPromise;
       const waitEnd = Date.now();
       logger.info(
         {
