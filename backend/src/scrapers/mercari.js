@@ -15,6 +15,17 @@ const API_MATCH = '/v2/entities:search';
 // "the SPA never called the API" timeout, without changing any scrape
 // behavior, timeout, retry, or concurrency logic.
 const API_HOST = 'api.mercari.jp';
+// EXPERIMENTAL (2026-09-17, NOT the final fix) — controlled test only.
+// Render logs showed /v2/entities:search fired at ~21s in 1/6 attempts
+// (after our then-20000ms waitForResponse() budget had already given up),
+// with zero pageerror and a correctly-loaded page in every attempt — the
+// evidence points at a timing/budget problem, not a permanent block. This
+// constant ONLY widens waitForResponse()'s own timeout, to measure whether
+// Mercari's search call gets reliably captured given more room. It is
+// deliberately kept below the 45s outer AbortController deadline (untouched)
+// so that deadline still fires and cleans up if this doesn't pan out.
+// page.goto()'s own timeout is intentionally NOT changed — still TIMEOUT_MS.
+const MERCARI_API_TIMEOUT_MS = 35000;
 
 // Mercari item-condition codes → human label (Japanese, as shown on listing).
 const CONDITION_MAP = {
@@ -227,10 +238,12 @@ async function search(context, query, opts = {}) {
     await paceDomain(HOST);
 
     // Listen for the API response BEFORE navigating, so we don't miss it.
+    // Timeout is MERCARI_API_TIMEOUT_MS (experimental, see comment above the
+    // constant) — deliberately NOT TIMEOUT_MS, unlike page.goto() below.
     const apiResponsePromise = page
       .waitForResponse(
         (resp) => resp.url().includes(API_MATCH) && resp.request().method() === 'POST',
-        { timeout: TIMEOUT_MS }
+        { timeout: MERCARI_API_TIMEOUT_MS }
       )
       .catch(() => null);
 

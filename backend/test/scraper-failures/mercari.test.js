@@ -482,3 +482,44 @@ test('mercari.search: a page-error/console message beyond the diagnostic cap is 
   assert.equal(captured.pageErrorsSeen, 25, 'the true total must still be counted past the cap');
   assert.equal(warnCallsForPageError, 20, 'individual page-error log lines must stop at the cap (no flooding)');
 });
+
+// --- Experimental widened waitForResponse() timeout (2026-09-17, NOT the
+// final fix) --- See src/scrapers/mercari.js's MERCARI_API_TIMEOUT_MS
+// comment: Render logs showed /v2/entities:search firing at ~21s in one
+// attempt, after the previous 20000ms waitForResponse() budget had already
+// given up. This constant widens ONLY that wait, to measure on Render
+// whether the call gets reliably captured with more room. page.goto()'s own
+// timeout is a separate, unchanged concern (still TIMEOUT_MS).
+
+test('mercari.search: waitForResponse() is called with the widened 35000ms experimental timeout, not the 20000ms nav timeout', async () => {
+  let capturedTimeout = null;
+  const ctx = makeFakeContext({
+    waitForResponse: async (_predicate, options) => {
+      capturedTimeout = options?.timeout;
+      return null;
+    },
+  });
+  await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  assert.equal(capturedTimeout, 35000, 'waitForResponse() must use the experimental MERCARI_API_TIMEOUT_MS, not the 20000ms nav timeout');
+});
+
+test('mercari.search: page.goto() keeps its own unrelated 20000ms timeout, unaffected by the waitForResponse experiment', async () => {
+  let capturedGotoTimeout = null;
+  const ctx = makeFakeContext({
+    goto: async (_url, options) => {
+      capturedGotoTimeout = options?.timeout;
+      return { status: () => 200 };
+    },
+    waitForResponse: async () => null,
+  });
+  await assert.rejects(() => mercari.search(ctx, 'iphone'), /not observed/);
+  assert.equal(capturedGotoTimeout, 20000, 'page.goto() must keep using PER_NAV_TIMEOUT_MS (20000ms), unchanged by this experiment');
+});
+
+test('mercari.search: a successful scrape within the widened window still resolves normally', async () => {
+  const ctx = makeFakeContext({
+    waitForResponse: async () => fakeApiResponse({ items: [] }),
+  });
+  const results = await mercari.search(ctx, 'iphone');
+  assert.deepEqual(results, [], 'the experimental timeout change must not affect a normal successful outcome');
+});
